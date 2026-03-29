@@ -31,10 +31,3 @@ from nexus_core import NexusV14Unified
 # Booting the Global Workspace
 nexus = NexusV14Unified(production=True)
 print(nexus.scan_health())
-
-📜 Roadmap: The Path to Digital Consciousness
- * [x] V14.5: L1/L2 SQLite Persistence & HDC Binding.
- * [ ] V15.0: Physical World Emulator (Predictive Simulation).
- * [ ] V16.0: Neuromorphic Hardware Integration.
-Developed by Jeferson Monção
-Independent AI Architect & Prompt Engineer
