@@ -1,0 +1,8 @@
+# ── NEXUS V14 UNIFIED — dependências do SERVIDOR HTTP (nexus_server.py) ───────
+#   pip install -r requirements-server.txt
+#
+# Requer o kernel primeiro:  pip install -r requirements.txt
+-r requirements.txt
+
+fastapi>=0.110
+uvicorn[standard]>=0.27

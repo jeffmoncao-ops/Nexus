@@ -1,0 +1,6 @@
+# ── NEXUS V14 UNIFIED — dependências de desenvolvimento/testes ────────────────
+-r requirements-server.txt
+
+pytest>=8.0
+pytest-asyncio>=0.23
+httpx>=0.27        # usado pelo TestClient do FastAPI

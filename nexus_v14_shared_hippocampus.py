@@ -46,7 +46,7 @@
 
 from __future__ import annotations
 
-import array, ast, asyncio, contextlib, hashlib, io, json, math, os, re
+import array, ast, asyncio, contextlib, hashlib, io, json, math, os, re, sys
 import atexit, struct, threading, time, unicodedata, random
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
@@ -67,6 +67,14 @@ try:
     _AIOSQLITE_OK = True
 except ImportError:
     _AIOSQLITE_OK = False
+
+# ── fastapi/uvicorn: opcional (servidor HTTP em nexus_server.py) ───────────
+try:
+    import fastapi as _fastapi        # noqa: F401
+    import uvicorn as _uvicorn        # noqa: F401
+    _HAS_FASTAPI = True
+except ImportError:
+    _HAS_FASTAPI = False
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -98,7 +106,17 @@ _STOP_PT: frozenset = frozenset({
     "meu","minha","ele","ela","eles","elas","eu","tu","você","nós",
     "todo","toda","todos","todas","cada","qualquer","nenhum","nenhuma",
     "aquilo","isto","lá","cá","muito","pouco","bem","mal",
-})
+    "explicar","explica","explique","explique-me","aprender","aprenda","conte",
+    "fale","diga","mostrar","mostre","definir","defina","significa","existe",
+    "existem","seria","seriam","favor","sobre","resumo","explana",
+}) | {
+    'qual','quais','quando','onde','porque','porquê','como','explique','explica',
+    'fale','sobre','conte','quem','seria','existe','existem','significa',
+}
+
+# Alias histórico: o gate epistêmico usava uma lista própria; agora a fonte
+# única de verdade é _STOP_PT (questões/instruções nunca contam como conteúdo).
+_GATE_STOP = _STOP_PT
 
 _ANTONYMS: Dict[str, str] = {
     'quente':'frio','frio':'quente','vivo':'morto','morto':'vivo',
@@ -158,6 +176,14 @@ _REL_PATTERNS: List[Tuple] = [
     (re.compile(r'^([\w\s]{2,25}?)\s+produz\s+([\w\s]{2,25})$', re.I), REL_PRODUCES),
     (re.compile(r'^([\w\s]{2,25}?)\s+(?:faz\s+parte|pertence)\s+([\w\s]{2,25})$', re.I), REL_PART_OF),
 ]
+
+# Palavras interrogativas/genéricas ignoradas pelo gate epistêmico
+# Termos de pergunta/instrução que nunca devem contar como conteúdo em
+# inferência nem no gate epistêmico (unificado em _STOP_PT).
+_GATE_TERMS = frozenset({
+    "como", "conte", "existe", "existem", "explica", "explique", "fale", "onde", "porque", "porquê", "quais", "qual", "quando", "quem", "seria", "significa", "sobre",
+})
+
 
 _CONTEXT_LABELS: Dict[str, str] = {
     'code':    'programação código algoritmo função',
@@ -219,10 +245,16 @@ class SparseSDR:
             self._idx = array.array('H')
         elif isinstance(indices, array.array):
             self._idx = indices
-        elif isinstance(indices, (list, set, frozenset)):
-            self._idx = array.array('H', sorted(int(i) for i in indices))
+        elif isinstance(indices, SparseSDR):
+            self._idx = array.array('H', indices._idx)
         else:
-            self._idx = array.array('H')
+            # Qualquer iterável de índices (list, set, range, gerador…).
+            # Antes, iteráveis como range() eram SILENCIOSAMENTE descartados,
+            # produzindo um SDR vazio — bug sutil que zerava densidade.
+            try:
+                self._idx = array.array('H', sorted({int(i) for i in indices}))
+            except (TypeError, ValueError):
+                self._idx = array.array('H')
 
     @classmethod
     def from_indices(cls, indices) -> 'SparseSDR':
@@ -258,6 +290,20 @@ class SparseSDR:
         if not a and not b: return 1.0
         u = len(a | b)
         return len(a & b) / u if u else 0.0
+
+    # ── Densidade (sparsity) ──────────────────────────────────────────────────
+    # Definidas na classe (e não como monkey-patch do V11.2) para funcionarem
+    # também em ambientes sem numpy.
+
+    def sparsity(self) -> float:
+        """Fração de bits ativos do espaço SDR (ideal: SDR_SPARSITY_IDEAL)."""
+        return len(self._idx) / float(SDR_SIZE)
+
+    def bit_density_valid(self, lo: float = None, hi: float = None) -> bool:
+        """True se a densidade estiver na faixa biológica saudável."""
+        if lo is None: lo = globals().get('SDR_SPARSITY_MIN', 0.005)
+        if hi is None: hi = globals().get('SDR_SPARSITY_MAX', 0.08)
+        return lo <= self.sparsity() <= hi
 
     def overlap_score(self, other: 'SparseSDR') -> float:
         a = set(self._idx)
@@ -4046,7 +4092,12 @@ _CBR_DESCS: Dict[str, List[str]] = {
     'binary_search':   ['busca binária','binary search','busca em lista ordenada'],
     'bubble_sort':     ['bubble sort','ordenação bolha','ordena bolha'],
     'merge_sort':      ['merge sort','ordenação fusão','ordena por fusão'],
-    'quicksort':       ['quicksort','quick sort','ordenação rápida'],
+    'quicksort':       ['quicksort','quick sort','ordenação rápida',
+                        # formas genéricas: "ordenar uma lista" caía em is_prime
+                        # (união de tokens dava 0.2 para "número") — aqui o match
+                        # de conteúdo é forte (ordenar+lista) e vence.
+                        'ordenar lista','ordenar uma lista','ordenar array',
+                        'ordenar números','ordenação de lista','sort'],
     'palindrome':      ['palíndromo','palindrome','verificar palíndromo'],
     'two_sum':         ['two sum','dois valores','soma alvo','soma de dois'],
     'gcd_lcm':         ['mdc','mmc','máximo divisor','mínimo múltiplo','gcd','lcm'],
@@ -4108,12 +4159,18 @@ class CodeGeneralizer:
                     self._cbr.append((d, intent, code))
 
     def retrieve(self, desc: str, min_score: float = 0.15) -> Optional[Tuple[str, str]]:
-        d_words = {w for w in re.findall(r'[a-záàâãéèêíóòôõúùûç\w]+', desc.lower())
-                   if len(w) > 1 and w not in _STOP_CODE}
+        def _tokens(s: str) -> set:
+            """Tokens úteis; se TODOS forem stopwords ("ordenar lista"), devolve
+            o conjunto bruto como último recurso — antes esse caso não casava
+            nada e o usuário recebia "padrão não encontrado"."""
+            raw = {w for w in re.findall(r'[a-záàâãéèêíóòôõúùûç\w]+', s.lower())
+                   if len(w) > 1}
+            return (raw - _STOP_CODE) or raw
+
+        d_words = _tokens(desc)
         best_s, best_i, best_c = 0.0, None, None
         for d, intent, code in self._cbr:
-            c_words = {w for w in re.findall(r'[a-záàâãéèêíóòôõúùûç\w]+', d.lower())
-                       if len(w) > 1 and w not in _STOP_CODE}
+            c_words = _tokens(d)
             if not c_words:
                 continue
             score = len(d_words & c_words) / max(len(d_words | c_words), 1)
@@ -5416,7 +5473,26 @@ class SharedMemory:
                 INSERT INTO shared_facts_fts(shared_facts_fts, rowid, fact_plain)
                 VALUES('delete', old.id, old.fact_plain);
             END;
+
+            -- Atribuição N:N fato ⇄ cérebro especialista.
+            -- Um fato pode ser relevante para VÁRIOS domínios (cross-domain
+            -- learning), por isso brain_origin guarda apenas a origem primária
+            -- e esta tabela guarda todas as atribuições.
+            CREATE TABLE IF NOT EXISTS shared_fact_brains (
+                fact_id   INTEGER NOT NULL,
+                brain_id  TEXT    NOT NULL,
+                ts        REAL    NOT NULL,
+                PRIMARY KEY (fact_id, brain_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_sfb_brain ON shared_fact_brains(brain_id);
         """)
+        self._conn.commit()
+        # Migração: fatos antigos (gravados antes desta tabela existir) herdam
+        # a atribuição do seu brain_origin.
+        self._conn.execute(
+            "INSERT OR IGNORE INTO shared_fact_brains(fact_id, brain_id, ts) "
+            "SELECT id, brain_origin, ts FROM shared_facts WHERE brain_origin <> 'core'"
+        )
         self._conn.commit()
 
     # ── Cálculo do SDR Hash ──────────────────────────────────────────────────
@@ -5458,8 +5534,14 @@ class SharedMemory:
     def store(self, fact: str, brain_origin: str = 'core',
               temporal_cluster: Optional[int] = None) -> bool:
         """
-        Armazena um fato na memória compartilhada.
-        Se guard estiver disponível, também armazena versão cifrada.
+        Armazena um fato na memória compartilhada e o atribui ao cérebro de origem.
+
+        Idempotente quanto ao texto (UNIQUE fact_plain), mas SEMPRE registra a
+        atribuição em shared_fact_brains: um fato aprendido pelo núcleo ('core')
+        e depois reivindicado por um cérebro especialista passa a pertencer
+        também àquele domínio — é isso que permite cross-domain learning.
+
+        Retorna True se o fato foi criado ou se uma nova atribuição foi feita.
         """
         tc = temporal_cluster if temporal_cluster is not None else self._session_id
         sdr_hash = self.compute_sdr_hash(fact)
@@ -5473,10 +5555,38 @@ class SharedMemory:
                 (fact_enc, fact, sdr_hash, tc,
                  self.INITIAL_WEIGHT, brain_origin, time.time())
             )
+            created = self._conn.execute("SELECT changes()").fetchone()[0] > 0
+            row = self._conn.execute(
+                "SELECT id FROM shared_facts WHERE fact_plain = ?", (fact,)
+            ).fetchone()
             self._conn.commit()
-            return self._conn.execute("SELECT changes()").fetchone()[0] > 0
+            if row is None:
+                return False
+            attributed = False
+            if brain_origin and brain_origin != 'core':
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO shared_fact_brains(fact_id, brain_id, ts) "
+                    "VALUES (?, ?, ?)",
+                    (row[0], brain_origin, time.time())
+                )
+                attributed = self._conn.execute("SELECT changes()").fetchone()[0] > 0
+                self._conn.commit()
+            return bool(created or attributed)
         except Exception:
             return False
+
+    # ── Atribuição fato ⇄ cérebro ─────────────────────────────────────────────
+
+    def _brain_clause(self) -> str:
+        """SQL que resolve os fatos atribuídos a um cérebro (tabela N:N + origem)."""
+        return ("id IN (SELECT fact_id FROM shared_fact_brains WHERE brain_id = ?) "
+                "OR brain_origin = ?")
+
+    def facts_of_brain(self, brain_id: str) -> List[str]:
+        """Fatos atribuídos a um cérebro especialista."""
+        return [r[0] for r in self._conn.execute(
+            f"SELECT fact_plain FROM shared_facts WHERE {self._brain_clause()} "
+            "ORDER BY recall_weight DESC", (brain_id, brain_id)).fetchall()]
 
     # ── Busca Temporal-Contextual (Otimizada) ────────────────────────────────
 
@@ -5513,9 +5623,11 @@ class SharedMemory:
                     "SELECT sf.id, sf.fact_plain, sf.sdr_hash, sf.recall_weight, sf.ts "
                     "FROM shared_facts sf "
                     "INNER JOIN shared_facts_fts fts ON sf.id = fts.rowid "
-                    "WHERE shared_facts_fts MATCH ? AND sf.brain_origin = ? "
+                    "WHERE shared_facts_fts MATCH ? AND ("
+                    "  sf.id IN (SELECT fact_id FROM shared_fact_brains WHERE brain_id = ?)"
+                    "  OR sf.brain_origin = ?) "
                     "ORDER BY sf.recall_weight DESC LIMIT 100",
-                    (fts_terms, brain_filter)
+                    (fts_terms, brain_filter, brain_filter)
                 ).fetchall()
             else:
                 rows = self._conn.execute(
@@ -5594,21 +5706,37 @@ class SharedMemory:
     def all_facts(self, brain_filter: Optional[str] = None) -> List[str]:
         if brain_filter:
             return [r[0] for r in self._conn.execute(
-                "SELECT fact_plain FROM shared_facts WHERE brain_origin=? "
-                "ORDER BY recall_weight DESC", (brain_filter,)).fetchall()]
+                f"SELECT fact_plain FROM shared_facts WHERE {self._brain_clause()} "
+                "ORDER BY recall_weight DESC", (brain_filter, brain_filter)).fetchall()]
         return [r[0] for r in self._conn.execute(
             "SELECT fact_plain FROM shared_facts ORDER BY recall_weight DESC").fetchall()]
 
     def stats(self) -> Dict:
         total = self._conn.execute("SELECT COUNT(*) FROM shared_facts").fetchone()[0]
+        # Agrega pela ORIGEM e pelas ATRIBUIÇÕES (N:N) — o mesmo fato pode
+        # aparecer em mais de um domínio.
         by_brain = self._conn.execute(
-            "SELECT brain_origin, COUNT(*), AVG(recall_weight) "
-            "FROM shared_facts GROUP BY brain_origin"
+            "SELECT brain_origin, COUNT(*) FROM shared_facts GROUP BY brain_origin"
         ).fetchall()
+        attrib = self._conn.execute(
+            "SELECT brain_id, COUNT(*) FROM shared_fact_brains GROUP BY brain_id"
+        ).fetchall()
+        weights = self._conn.execute(
+            "SELECT brain_id, AVG(sf.recall_weight) FROM shared_fact_brains sfb "
+            "JOIN shared_facts sf ON sf.id = sfb.fact_id GROUP BY brain_id"
+        ).fetchall()
+        weights_by_brain = {r[0]: round(r[1], 4) for r in weights}
+        by_brain_dict = {r[0]: {'count': r[1],
+                                'avg_weight': weights_by_brain.get(r[0], 0.0)}
+                         for r in by_brain}
+        for brain_id, count in attrib:
+            entry = by_brain_dict.setdefault(brain_id, {'count': 0, 'avg_weight': 0.0})
+            entry['count'] = max(entry['count'], count)
+            entry['attributed'] = count
         return {
             'total_facts': total,
             'session_id': self._session_id,
-            'by_brain': {r[0]: {'count': r[1], 'avg_weight': round(r[2], 4)} for r in by_brain},
+            'by_brain': by_brain_dict,
         }
 
     def __len__(self) -> int:
@@ -5888,28 +6016,41 @@ class XORBinding:
         self._bindings.append((bound, subj, rel, obj))
         return bound
     
-    def unbind_object(self, subj: str, rel: str, top_k: int = 3,
-                      min_overlap: float = 0.08) -> List[Tuple[float, str]]:
-        """Dado sujeito e relação, encontra objetos via XOR reverso.
-        
-        Para cada binding armazenado:
-          candidate = binding ⊕ SDR(subj) ⊕ SDR(rel)  
-          Se candidate tem alto overlap com SDR(obj_original) → match
+    def unbind_object_verified(self, subj: str, rel: str, top_k: int = 3,
+                               min_overlap: float = 0.08
+                               ) -> List[Tuple[float, str, str]]:
+        """Como unbind_object, mas devolve (overlap, SUJEITO_ARMAZENADO, obj).
+
+        O unbinding puro devolve o objeto do binding de maior overlap — que
+        pode pertencer a OUTRO sujeito (vizinho no espaço SDR). Usar esse objeto
+        direto geraria alucinação do tipo "buraco negro é <definição da
+        mitocôndria>"; quem chama deve conferir se o sujeito armazenado casa
+        com o sujeito perguntado.
         """
         s_sdr = self._enc.encode(subj)
         r_sdr = self._get_rel_sdr(rel)
         query = s_sdr ^ r_sdr
-        
+
         results = []
         for bound, b_subj, b_rel, b_obj in self._bindings:
             candidate = bound ^ query  # should approximate SDR(obj)
-            obj_sdr = self._enc.encode(b_obj)
-            overlap = candidate.overlap_score(obj_sdr)
+            overlap = candidate.overlap_score(self._enc.encode(b_obj))
             if overlap >= min_overlap:
-                results.append((overlap, b_obj))
-        
+                results.append((overlap, b_subj, b_obj))
+
         results.sort(reverse=True)
         return results[:top_k]
+
+    def unbind_object(self, subj: str, rel: str, top_k: int = 3,
+                      min_overlap: float = 0.08) -> List[Tuple[float, str]]:
+        """Dado sujeito e relação, encontra objetos via XOR reverso.
+
+        Para cada binding armazenado:
+          candidate = binding ⊕ SDR(subj) ⊕ SDR(rel)
+          Se candidate tem alto overlap com SDR(obj_original) → match
+        """
+        return [(ov, obj) for ov, _, obj
+                in self.unbind_object_verified(subj, rel, top_k, min_overlap)]
     
     def analogy(self, a: str, b: str, c: str, top_k: int = 3) -> List[Tuple[float, str]]:
         """Analogia SDR: A:B :: C:? 
@@ -7423,8 +7564,11 @@ class NexusV10:
 
         return True
 
-    def save(self, filepath: str) -> bool:
+    def save(self, filepath: Optional[str] = None) -> bool:
         """Salva o estado em disco de forma atômica.
+
+        `filepath` é opcional: por padrão usa o _persist_path configurado
+        (set_persist_path / enable_autosave).
 
         Escreve num arquivo temporário no mesmo diretório e só então
         renomeia para o destino final (os.replace é atômico no POSIX).
@@ -7433,6 +7577,7 @@ class NexusV10:
         durante a serialização.
         """
         import tempfile
+        filepath = filepath or self._persist_path
         try:
             data = {
                 'version':      self.VERSION,
@@ -7698,6 +7843,37 @@ class NexusV10:
         tokens = [w for w in re.findall(r'[a-záéíóúâêôàã\w]{3,}', tl)
                   if w not in _SKIP]
         return tokens[0] if tokens else ''
+
+    # ── Gate epistêmico (anti-alucinação) ────────────────────────────────────
+
+    @staticmethod
+    def _content_tokens(text: str) -> set:
+        """Tokens de conteúdo (sem stopwords, sem acento, ≥4 chars)."""
+        return {_deaccent(w) for w in re.findall(r'\w{4,}', str(text or '').lower())
+                if w not in _STOP_PT}
+
+    def _fact_is_relevant(self, query: str, fact: str, min_shared: int = 1) -> bool:
+        """
+        True se o fato candidato compartilha conteúdo com a consulta.
+
+        Um recuperador vetorial sempre devolve ALGUM vizinho mais próximo —
+        mesmo para assuntos que o sistema nunca aprendeu. Sem este gate, o
+        Nexus responderia temas desconhecidos ("o que é um quasar?") com fatos
+        sem relação, violando o princípio epistêmico do projeto. Com o gate,
+        o pior caso vira uma admissão honesta de ignorância (speak_unknown).
+        """
+        q = self._content_tokens(query)
+        f = self._content_tokens(fact)
+        # Sem tokens de conteúdo (consulta só com palavras curtas/stopwords tipo
+        # "lei de ohm") não há como julgar relevância — não bloqueia.
+        if not q or not f:
+            return True
+        # Prefixo de 6 chars cobre flexões (mitocôndria/mitocondrial,
+        # quasar/quasares) sem casar radicais alheios ("supermassivo" NÃO deve
+        # casar com "superfície"; "quasar" não deve casar com "quadrado").
+        q_stems = {w[:6] for w in q}
+        f_stems = {w[:6] for w in f}
+        return len(q_stems & f_stems) >= min_shared
 
     def _route(self, text: str, sdr: SparseSDR) -> str:
         tl = text.lower().strip()
@@ -8700,18 +8876,29 @@ class NexusV10:
                 if not direct:
                     direct = fs_hits
 
+                # Gate epistêmico: a busca por prefixo de 3 chars (plural→singular)
+                # também casa palavras SEM relação ("quasar"→"quadrado",
+                # "quicksort"→"química"). Só aceitamos candidatos que
+                # compartilham radical (5 chars) com a consulta.
+                direct = [h for h in direct if self._fact_is_relevant(text, h)]
+
                 if direct:
+                    # A seleção final opera SOMENTE sobre os candidatos aprovados
+                    # pelo gate epistêmico (selecionar de `scored` cru reintroduziria
+                    # o fato alucinado que o gate acabou de rejeitar).
+                    aprovados = set(direct)
+                    scored_ok = [(s, h) for s, h in scored if h in aprovados]
                     # Prefere o fato de maior score; o filtro copulativo só atua
                     # quando o candidato tiver score >= que o melhor.
-                    top_score = scored[0][0] if scored else 0
-                    top_group = [h for s, h in scored if s == top_score]
+                    top_score = scored_ok[0][0] if scored_ok else 0
+                    top_group = [h for s, h in scored_ok if s == top_score]
                     # Dentro do top-group, prefere copulativo (contém " é " cedo)
                     cop = [h for h in top_group if ' é ' in h.lower()[:80]]
                     best  = cop[0] if cop else top_group[0]
                     # Extra: só inclui fato relacionado (overlap de tokens de conteúdo)
                     extra = ''
                     best_toks = set(re.findall(r'\w{4,}', best.lower())) - _STOP_PT
-                    for s2, h2 in scored:
+                    for s2, h2 in scored_ok:
                         if h2 == best or s2 <= 0:
                             continue
                         h2_toks = set(re.findall(r'\w{4,}', h2.lower())) - _STOP_PT
@@ -8724,9 +8911,13 @@ class NexusV10:
 
         # V10: XOR unbinding — busca relações no espaço SDR
         if subj:
-            xor_results = self.xor_bind.unbind_object(subj, 'é', top_k=3, min_overlap=0.05)
+            xor_results = self.xor_bind.unbind_object_verified(subj, 'é', top_k=3,
+                                                               min_overlap=0.05)
             if xor_results and not fs_hits:
-                xor_facts = [f"{subj} é {obj}" for _, obj in xor_results]
+                # Só aceita binding cujo SUJEITO ARMAZENADO casa com o sujeito da
+                # pergunta — senão comporíamos "X é <definição de outra coisa>".
+                xor_facts = [f"{subj} é {obj}" for _, b_subj, obj in xor_results
+                             if self._fact_is_relevant(subj, b_subj)]
                 if xor_facts:
                     return self.mouth.speak_fact(xor_facts[0], 
                                                  xor_facts[1] if len(xor_facts) > 1 else '')
@@ -8737,13 +8928,20 @@ class NexusV10:
             propagated = self.sdr_reasoner.propagate_activation(
                 sdr, memory_sdrs, depth=2, threshold=0.08)
             if propagated and not fs_hits:
-                best_prop = propagated[0][1]
-                extra_prop = propagated[1][1] if len(propagated) > 1 else ''
-                return self.mouth.speak_fact(best_prop, extra_prop)
+                # Gate epistêmico: só responde se o fato propagado tiver
+                # relação lexical real com a consulta (evita alucinação).
+                prop_ref = [f for _, f in propagated if self._fact_is_relevant(text, f)]
+                if prop_ref:
+                    best_prop = prop_ref[0]
+                    extra_prop = prop_ref[1] if len(prop_ref) > 1 else ''
+                    return self.mouth.speak_fact(best_prop, extra_prop)
 
         # Estratégia 2: HybridRetriever (FactStore → Brain → MiniEmbed)
         # + re-ranking por SalienceEngine e embed cosine
         hits = self.retriever.retrieve(text, sdr, top_k=5)
+        # Gate epistêmico: descarta candidatos sem NENHUM termo de conteúdo em
+        # comum com a consulta (vizinho mais próximo ≠ resposta relacionada).
+        hits = [h for h in hits if self._fact_is_relevant(text, h[1])]
         if hits:
             # Re-rank: SalienceEngine pondera por frequência/recência de acesso
             qv = self.embed.sentence_vector(text) if self.embed._vocab else None
@@ -8797,9 +8995,14 @@ class NexusV10:
                 embed=self.embed
             )
             if top_concepts:
-                top3 = [c for c, _ in top_concepts[:3]]
-                related = ', '.join(top3)
-                return f'Conceitos relacionados: {related}'
+                # Remove "conceitos" que são apenas as próprias palavras da consulta
+                # (o graph registra a query ao ser processada) — eco não é resposta.
+                q_stems = {w[:6] for w in self._content_tokens(text)}
+                top3 = [c for c, _ in top_concepts
+                        if _deaccent(c.lower())[:6] not in q_stems][:3]
+                if top3:
+                    related = ', '.join(top3)
+                    return f'Conceitos relacionados: {related}'
 
         # Estratégia 4: Inferência transitiva
         inf = self.brain.infer_transitive(sdr, text)
@@ -9193,44 +9396,54 @@ class NexusV10:
 # §25  ENTRY POINT / DEMO
 # ══════════════════════════════════════════════════════════════════════════════
 
-if __name__ == '__main__':
-    import sys
-
+def _cli_v10_basic_tests() -> bool:
+    """Teste rápido das 4 capacidades básicas do núcleo V10 (usado por --v10-test)."""
     print('=' * 60)
     print('NEXUS V10 ULTIMATE — Sistema Cognitivo SDR-First')
     print('=' * 60)
 
     n = NexusV10()
+    tests = [
+        ('aprenda: variável é um espaço de memória nomeado que armazena valores', 'Aprendi'),
+        ('o que é variável?', 'memória'),
+        ('implemente fibonacci', 'fibonacci'),
+        ('calcule 2 + 2 * 3', '8'),
+    ]
+    ok = 0
+    for prompt, expected in tests:
+        resp = n.chat(prompt)
+        passed = expected.lower() in resp.lower()
+        print(f'  {"✓" if passed else "✗"} {prompt[:50]} → {resp[:60]}')
+        if passed:
+            ok += 1
+    print(f'\n{ok}/{len(tests)} testes básicos passando.')
+    return ok == len(tests)
 
-    if len(sys.argv) > 1 and sys.argv[1] == '--test':
-        # Modo teste rápido
-        tests = [
-            ('aprenda: variável é um espaço de memória nomeado que armazena valores', 'Aprendi'),
-            ('o que é variável?', 'memória'),
-            ('implemente fibonacci', 'fibonacci'),
-            ('calcule 2 + 2 * 3', '8'),
-        ]
-        ok = 0
-        for prompt, expected in tests:
-            resp = n.chat(prompt)
-            passed = expected.lower() in resp.lower()
-            print(f'  {"✓" if passed else "✗"} {prompt[:50]} → {resp[:60]}')
-            if passed:
-                ok += 1
-        print(f'\n{ok}/{len(tests)} testes básicos passando.')
-    else:
-        # Modo interativo
-        print('Digite "sair" para encerrar.\n')
-        while True:
-            try:
-                user = input('> ').strip()
-            except (EOFError, KeyboardInterrupt):
-                print('\nAté mais!')
-                break
-            if user.lower() in ('sair', 'exit', 'quit'):
-                break
-            if user:
-                print(n.chat(user))
+
+def _cli_interactive(nexus, commands: Optional[Dict[str, Any]] = None) -> None:
+    """
+    Loop interativo compartilhado por todos os modos.
+    `commands` mapeia palavra-chave → callable sem argumentos.
+    """
+    commands = commands or {}
+    print('\nDigite "sair" para encerrar.')
+    if commands:
+        print('Comandos especiais: ' + ', '.join(f'"{k}"' for k in commands))
+    while True:
+        try:
+            user = input('> ').strip()
+        except (EOFError, KeyboardInterrupt):
+            print('\nAté mais!')
+            break
+        if not user:
+            continue
+        if user.lower() in ('sair', 'exit', 'quit'):
+            break
+        handler = commands.get(user.lower())
+        if handler is not None:
+            print(handler())
+            continue
+        print(nexus.chat(user))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -9341,10 +9554,23 @@ class SpecialistBrain:
 
     # ── Relevância ────────────────────────────────────────────────────────────
 
+    _STEM_LEN = 6   # radical usado no match flexivo (plural/gênero/derivação)
+
     def relevance(self, text: str) -> float:
-        """Score de relevância [0..1] para um texto dado."""
-        words = set(re.findall(r'\w{3,}', text.lower()))
+        """
+        Score de relevância [0..1] de um texto para este domínio.
+
+        Combina match exato de palavra-chave com match de radical — o segundo
+        cobre flexões que o match literal perde ("algoritmos"→"algoritmo",
+        "neurais"→"neural", "ordenar"→"ordenação" via radical comum).
+        """
+        words = set(re.findall(r'\w{3,}', str(text).lower()))
         kw_hit = len(words & self._kw)
+        if not kw_hit:
+            # Radical: normaliza acento e compara os primeiros N caracteres
+            stems = {_deaccent(w)[:self._STEM_LEN] for w in words if len(w) >= 5}
+            kw_stems = {_deaccent(k)[:self._STEM_LEN] for k in self._kw if len(k) >= 5}
+            kw_hit = len(stems & kw_stems)
         if not kw_hit:
             return 0.0
         return min(1.0, kw_hit / max(len(self._kw) * 0.3, 1))
@@ -9517,6 +9743,10 @@ class GlobalWorkspaceNexus:
                 'inteligência','aprendizado','machine','neural','computador',
                 'bit','byte','processador','memória','sistema operacional',
                 'docker','kubernetes','cloud','software','hardware','tecnologia',
+                # ciência da computação aplicada (ordenação/busca/estruturas)
+                'ordenação','array','lista','pilha','fila','pivô','recursão',
+                'quicksort','mergesort','complexidade','depurar','thread',
+                'cache','kernel','json','dados','criptografia','chave','hash',
             ],
         },
         {
@@ -9694,6 +9924,12 @@ class GlobalWorkspaceNexus:
             if best_score >= 0.45 and best_facts:
                 best_brain_name = self._brains[best_brain_id].name
                 specialist_text = best_facts[0][1]
+                # Gate epistêmico: a similaridade SDR sozinha é ruidosa (o
+                # quicksort já foi anexado a uma resposta sobre o ciclo da
+                # água). O brain só CONTRIBUI se o fato compartilhar conteúdo
+                # com a pergunta.
+                if not self._core._fact_is_relevant(query, specialist_text):
+                    return core_response
                 if not self._texts_overlap(core_response, specialist_text, threshold=0.50):
                     self._stats['specialist_contributions'] += 1
                     return (f"{core_response}\n\n"
@@ -9806,25 +10042,27 @@ class GlobalWorkspaceNexus:
 
     # ── Internos ──────────────────────────────────────────────────────────────
 
+    MAX_PROPAGATION_TARGETS = 3   # evita poluir todos os domínios com um fato qualquer
+
     def _propagate_to_specialists(self, fact: str) -> bool:
         """
-        Propaga um fato para o(s) brain(s) mais relevante(s) semanticamente.
+        Propaga um fato para TODOS os brains com relevância semântica acima do
+        threshold (não apenas o melhor): um fato sobre "algoritmo genético"
+        pertence a tecnologia E a biologia simultaneamente — é isso que
+        caracteriza o Cross-Domain Learning do hipocampo compartilhado.
+
         Retorna True se pelo menos 1 brain recebeu o fato.
         """
-        fact_words = set(re.findall(r'\w{3,}', fact.lower()))
-        best_brain: Optional[SpecialistBrain] = None
-        best_score = 0.0
-
-        for brain in self._brains.values():
-            score = brain.relevance(fact)
-            if score > best_score:
-                best_score, best_brain = score, brain
-
-        # Threshold mínimo para não poluir brains irrelevantes
-        if best_brain and best_score > 0.05:
-            best_brain.learn(fact)
-            return True
-        return False
+        scored = [(brain.relevance(fact), brain) for brain in self._brains.values()]
+        scored = [(s, b) for s, b in scored if s > 0.05]
+        if not scored:
+            return False
+        scored.sort(key=lambda x: -x[0])
+        received = 0
+        for _, brain in scored[:self.MAX_PROPAGATION_TARGETS]:
+            if brain.learn(fact):
+                received += 1
+        return received > 0
 
     def _consult_specialists(self, query: str
                               ) -> List[Tuple[str, float, List[Tuple[float, str]]]]:
@@ -10023,23 +10261,27 @@ def run_nexus_tests(verbose: bool = True) -> bool:
     bio_brain = gw._brains.get('biologia')
     chk('Brain biologia existe', bio_brain is not None)
 
+    # Fatos vivem no HIPOCAMPO COMPARTILHADO (SharedMemory) — não em _facts local,
+    # que é apenas o fallback usado quando não há memória injetada.
     if bio_brain:
+        bio_facts = gw._shared_memory.all_facts(brain_filter='biologia')
         chk('Brain biologia tem fatos sobre fotossíntese',
-            any('fotoss' in f.lower() for f in bio_brain._facts),
-            f'fatos no brain bio={len(bio_brain._facts)}')
+            any('fotoss' in f.lower() for f in bio_facts),
+            f'fatos no brain bio={len(bio_facts)}')
 
         # Consulta direta ao brain
-        q_bio = bio_brain.query('o que é neurônio?', top_k=2)
-        chk('Brain bio responde query sobre neurônio',
-            len(q_bio) >= 0,  # pode ter ou não ter
+        q_bio = bio_brain.query('o que é fotossíntese?', top_k=2)
+        chk('Brain bio responde query sobre fotossíntese',
+            len(q_bio) >= 1,
             f'resultados={len(q_bio)}')
 
     # Verifica que tecnologia brain tem fatos de TI
     tech_brain = gw._brains.get('tecnologia')
     if tech_brain:
+        tech_facts = gw._shared_memory.all_facts(brain_filter='tecnologia')
         chk('Brain tecnologia tem fatos',
-            len(tech_brain._facts) >= 0,
-            f'fatos tech={len(tech_brain._facts)}')
+            len(tech_facts) >= 1,
+            f'fatos tech={len(tech_facts)}')
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # BLOCO 7 — add_brain() + remove_brain()
@@ -10054,7 +10296,7 @@ def run_nexus_tests(verbose: bool = True) -> bool:
     chk('add_brain() cria brain customizado', 'culinaria' in gw2._brains)
 
     gw2.learn('risoto é um prato italiano feito com arroz arbóreo e caldo')
-    cul_fatos = gw2._brains['culinaria']._facts
+    cul_fatos = gw2._shared_memory.all_facts(brain_filter='culinaria')
     chk('Brain culinária aprende fatos relevantes',
         any('risoto' in f.lower() for f in cul_fatos),
         f'fatos culinaria={len(cul_fatos)}')
@@ -10148,46 +10390,12 @@ def run_nexus_tests(verbose: bool = True) -> bool:
 # §ENTRY POINT GLOBAL WORKSPACE
 # ══════════════════════════════════════════════════════════════════════════════
 
-if __name__ == '__main__':
-    import sys as _sys
-
+def _cli_final_suite() -> bool:
+    """Suite integrada NexusFinal + GlobalWorkspaceNexus (usada por --v10-test)."""
     print('=' * 70)
     print('NEXUS FINAL + GLOBAL WORKSPACE — Sistema Cognitivo com Multi-Cérebros')
     print('=' * 70)
-
-    if '--test' in _sys.argv:
-        ok = run_nexus_tests(verbose=True)
-        _sys.exit(0 if ok else 1)
-
-    if '--gw' in _sys.argv or '--global' in _sys.argv:
-        # Modo GlobalWorkspace interativo
-        print('\nIniciando com Área de Trabalho Global (multi-brain)...')
-        n = GlobalWorkspaceNexus()
-        print('GlobalWorkspace ativo com', len(n._brains), 'brains especializados.')
-        print(n.brain_status())
-    else:
-        # Modo NexusFinal padrão (retrocompatível)
-        n = NexusFinal()
-
-    print('\nDigite "sair" para encerrar.')
-    print('Comandos especiais: "status", "saúde", "brains"\n')
-
-    while True:
-        try:
-            user = input('> ').strip()
-        except (EOFError, KeyboardInterrupt):
-            print('\nAté mais!')
-            break
-        if not user:
-            continue
-        if user.lower() in ('sair', 'exit', 'quit'):
-            break
-        if user.lower() == 'brains' and hasattr(n, 'brain_status'):
-            print(n.brain_status())
-        elif user.lower() in ('saúde', 'saude', 'health'):
-            print(n.scan_health())
-        else:
-            print(n.chat(user))
+    return run_nexus_tests(verbose=True)
 
 
 
@@ -10712,9 +10920,52 @@ class FeatureExtractor:
         raise NotImplementedError
 
 
+def _normalize_image(image) -> List[List[Tuple[int, int, int]]]:
+    """
+    Normaliza qualquer entrada de imagem para List[List[(r, g, b)]] com 0-255.
+
+    Aceita:
+      • listas de listas de tuplas/listas RGB     → [[(r,g,b), ...], ...]
+      • escalas de cinza (listas de inteiros)     → replicadas em RGB
+      • numpy arrays (H,W,3) ou (H,W)             → convertidos
+    Retorna [] para entradas vazias/inválidas (nunca levanta exceção).
+    """
+    if image is None:
+        return []
+    if HAS_NUMPY and np is not None and isinstance(image, np.ndarray):
+        if image.ndim == 2:
+            image = image.tolist()
+        elif image.ndim == 3:
+            image = image.tolist()
+        else:
+            return []
+    if not isinstance(image, (list, tuple)) or len(image) == 0:
+        return []
+    out: List[List[Tuple[int, int, int]]] = []
+    for row in image:
+        if not isinstance(row, (list, tuple)):
+            return []
+        if len(row) == 0:
+            return []
+        new_row = []
+        for px in row:
+            if isinstance(px, (int, float)):
+                v = max(0, min(255, int(px)))
+                new_row.append((v, v, v))
+            elif isinstance(px, (list, tuple)) and len(px) >= 3:
+                new_row.append((max(0, min(255, int(px[0]))),
+                                max(0, min(255, int(px[1]))),
+                                max(0, min(255, int(px[2])))))
+            else:
+                return []
+        out.append(new_row)
+    return out
+
+
 class ColorFeature(FeatureExtractor):
     """Histograma de cores em HSV (8 bins H × 3 bins S = 24D)."""
     def extract(self, image) -> List[float]:
+        image = _normalize_image(image)
         hsv_hist = [0] * 24
         for row in image:
             for r, g, b in row:
@@ -10735,6 +10986,9 @@ class ColorFeature(FeatureExtractor):
 class EdgeFeature(FeatureExtractor):
     """Bordas via Sobel, histograma de magnitude e orientação (16D)."""
     def extract(self, image) -> List[float]:
+        image = _normalize_image(image)
+        if len(image) < 3 or len(image[0]) < 3:
+            return [0.0] * 16   # Sobel exige janela 3×3
         if HAS_NUMPY:
             return self._extract_np(image)
         gray = [[0.299 * r + 0.587 * g + 0.114 * b for r, g, b in row] for row in image]
@@ -10787,6 +11041,7 @@ class EdgeFeature(FeatureExtractor):
 class TextureFeature(FeatureExtractor):
     """Local Binary Patterns simplificado (8D)."""
     def extract(self, image) -> List[float]:
+        image = _normalize_image(image)
         gray = [[0.299 * r + 0.587 * g + 0.114 * b for r, g, b in row] for row in image]
         height = len(gray); width = len(gray[0]) if height else 0
         hist = [0] * 8
@@ -10811,6 +11066,9 @@ class MotionFeature(FeatureExtractor):
         self.prev_frame = None
 
     def extract(self, image) -> List[float]:
+        image = _normalize_image(image)
+        if not image:
+            return [0.0] * 8
         if self.prev_frame is None:
             self.prev_frame = image
             return [0.0] * 8
@@ -10842,6 +11100,9 @@ class MotionFeature(FeatureExtractor):
 class ShapeFeature(FeatureExtractor):
     """Proporção, área, centróide (8D)."""
     def extract(self, image) -> List[float]:
+        image = _normalize_image(image)
+        if not image or not image[0]:
+            return [0.0] * 8
         gray = [[0.299 * r + 0.587 * g + 0.114 * b for r, g, b in row] for row in image]
         mean_val = sum(sum(row) for row in gray) / max(len(gray) * len(gray[0]), 1)
         total = 0; sum_x = 0; sum_y = 0
@@ -10887,9 +11148,15 @@ class VisualEncoder:
 
     def encode(self, image, learn=False):
         """
-        image: lista de listas de tuplas (r,g,b) 0-255.
-        Retorna SparseSDR (ou lista de índices se standalone).
+        Codifica uma imagem em SparseSDR de ACTIVE_BITS bits ativos.
+
+        Aceita lista de listas de (r,g,b), escala de cinza (ints) ou numpy
+        array (H,W,3)/(H,W). Entrada vazia ou inválida → SparseSDR vazio
+        (nenhum bit ativo), sem exceção.
         """
+        image = _normalize_image(image)
+        if not image:
+            return SparseSDR()
         vectors = [feat.extract(image) for feat in self.features]
         bits = set()
         for i, vec in enumerate(vectors):
@@ -10909,13 +11176,10 @@ class VisualEncoder:
                     bits.append(extra)
                 extra += 1
         
-        try:
-            from nexus_v10_ultimate import SparseSDR
-            return SparseSDR.from_indices(sorted(bits))
-        except ImportError:
-            return sorted(bits)
+        return SparseSDR.from_indices(sorted(bits))
 
     def _hash_vector(self, vec, idx, feat_idx):
+        vec = list(vec) or [0.0]
         s = f"{feat_idx}|{idx}|{vec[idx % len(vec)]:.6f}"
         h = 0
         for c in s:
@@ -11088,6 +11352,9 @@ class AudioEncoder:
         self._seed = 0xDEADBEEF
 
     def encode(self, samples, sample_rate=16000, learn=False):
+        samples = list(samples) if samples is not None else []
+        if not samples:
+            return SparseSDR()   # silêncio/entrada vazia = nenhum bit ativo
         vectors = [feat.extract(samples, sample_rate) for feat in self.features]
         bits = set()
         for i, vec in enumerate(vectors):
@@ -11104,13 +11371,10 @@ class AudioEncoder:
                 if extra not in bits:
                     bits.append(extra)
                 extra += 1
-        try:
-            from nexus_v10_ultimate import SparseSDR
-            return SparseSDR.from_indices(sorted(bits))
-        except ImportError:
-            return sorted(bits)
+        return SparseSDR.from_indices(sorted(bits))
 
     def _hash_vector(self, vec, idx, feat_idx):
+        vec = list(vec) or [0.0]
         s = f"{feat_idx}|{idx}|{vec[idx % len(vec)]:.6f}"
         h = 0
         for c in s:
@@ -11298,12 +11562,29 @@ SDR_SPARSITY_IDEAL = 0.02
 # §2  NEXUS GUARD V11 — Criptografia XOR com SDR-Key Determinística
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _derive_master_key(seed: int, size: int) -> bytes:
+    """
+    KDF determinístico (SHA-256 em cadeia) para a chave mestra do NexusGuard.
+
+    Não depende de numpy: a MESMA chave é derivada em qualquer ambiente
+    (com ou sem numpy, em qualquer plataforma), garantindo que bancos
+    cifrados por uma instância possam ser decifrados por outra.
+    """
+    out = bytearray()
+    block = hashlib.sha256(f'nexus-guard-v11::seed={seed}'.encode('utf-8')).digest()
+    while len(out) < size:
+        out.extend(block)
+        block = hashlib.sha256(block).digest()
+    return bytes(out[:size])
+
+
 class NexusGuardV11:
     """
     Middleware de criptografia XOR com chave mestra gerada deterministicamente.
 
-    A SDR-Key é derivada de um seed fixo via numpy RandomState, garantindo
-    que a mesma chave seja reproduzida em qualquer instância com o mesmo seed.
+    A SDR-Key é derivada de um seed fixo via KDF SHA-256 (sem numpy),
+    garantindo que a mesma chave seja reproduzida em qualquer instância
+    com o mesmo seed — e em qualquer ambiente (edge, ARM, sem numpy).
 
     Métodos públicos:
       encrypt_payload(data) → str (hex cifrado)
@@ -11315,8 +11596,8 @@ class NexusGuardV11:
     KEY_SIZE = 256  # bytes — 256 bytes = chave longa para XOR rolling
 
     def __init__(self, key_seed: int = 0x4E455855):  # "NEXU" em hex
-        rng = np.random.RandomState(key_seed)
-        self.master_key: bytes = rng.bytes(self.KEY_SIZE)
+        self.key_seed = key_seed
+        self.master_key: bytes = _derive_master_key(key_seed, self.KEY_SIZE)
         self._hmac_secret: bytes = hashlib.sha256(self.master_key).digest()
 
     # ── Criptografia XOR ──────────────────────────────────────────────────────
@@ -11378,12 +11659,24 @@ class NexusSDRFilter:
     """
     Validador de pacotes baseado em densidade de bits (Sparsity Analysis).
 
-    Usa numpy para calcular a sparsity de cada pacote de entrada.
-    Se o pacote divergir da máscara SDR do Nexus (densidade fora do intervalo
-    biológico de ~2%), aplica 'Inibição Lateral' (bloqueio) e registra
-    como tentativa de intrusão no log de segurança.
+    Um pacote é ACEITO somente se:
+      1. Sua densidade de bits estiver na faixa biológica saudável
+         (SDR_SPARSITY_MIN..SDR_SPARSITY_MAX ≈ 0.5%..8%, ideal 2% = 80/4096).
+      2. Sua distribuição for informativa: os bits ativos precisam estar
+         espalhados pelo espaço SDR (span ≥ 25% do espaço). Isso bloqueia
+         padrões degenerados — payload truncado, vetor de uma só zona,
+         máscaras periódicas (ex: todos os bits pares) — sem descartar
+         texto/sensores legítimos.
 
-    Referência: SDR ideal = 2% ativo = 80/4096 bits
+    A sobreposição com a máscara SDR mestra é calculada e reportada como
+    diagnóstico, mas NÃO é usada como gate: para qualquer encoder
+    pseudoaleatório ela é indistinguível do acaso (~2%), então usá-la como
+    critério de bloqueio produziria falsos positivos randômicos.
+
+    Pacotes bloqueados geram 'Inibição Lateral' + registro de intrusão.
+
+    Implementação em Python puro (sem numpy): determinística e idêntica em
+    qualquer ambiente — requisito para edge/ARM, onde numpy pode não existir.
     """
 
     def __init__(self, sdr_size: int = SDR_SIZE,
@@ -11392,61 +11685,117 @@ class NexusSDRFilter:
         self.sdr_size = sdr_size
         self.min_sparsity = min_sparsity
         self.max_sparsity = max_sparsity
-        # Máscara SDR mestra: padrão esparso de referência (gerado deterministicamente)
-        rng = np.random.RandomState(SDR_SEED)
-        active_bits = rng.choice(sdr_size, size=SDR_ACTIVE, replace=False)
-        self._master_mask = np.zeros(sdr_size, dtype=np.uint8)
-        self._master_mask[active_bits] = 1
+        # Máscara SDR mestra: padrão esparso de referência (determinístico)
+        self._master_set = self._make_master_mask(sdr_size, SDR_ACTIVE, SDR_SEED)
         # Estatísticas
         self._total_packets   = 0
         self._blocked_packets = 0
         self._intrusions: List[Dict] = []
 
-    def compute_sparsity(self, data: Any) -> Tuple[float, np.ndarray]:
+    # ── Codificação determinística (Python puro) ─────────────────────────────
+
+    @staticmethod
+    def _xorshift(h: int) -> int:
+        """Mistura inteira determinística de 32 bits (sem dependências)."""
+        h ^= (h >> 16)
+        h = (h * 0x7FEB352D) & 0xFFFFFFFF
+        h ^= (h >> 15)
+        h = (h * 0x846CA68B) & 0xFFFFFFFF
+        h ^= (h >> 16)
+        return h
+
+    @classmethod
+    def _make_master_mask(cls, sdr_size: int, active: int, seed: int) -> Set[int]:
+        """Gera a máscara mestra de referência (mesmos bits em toda instância)."""
+        bits: Set[int] = set()
+        h = seed & 0xFFFFFFFF
+        while len(bits) < active:
+            h = cls._xorshift(h + len(bits) + 0x9E3779B9)
+            bits.add(h % sdr_size)
+        return bits
+
+    BITS_PER_BYTE = 3   # pacotes reais (≥7 bytes) entram na faixa biológica
+
+    def _encode_text(self, raw: bytes) -> List[int]:
+        """
+        Converte bytes em índices de bits ativos (SDR determinístico).
+
+        Cada byte ativa até 3 bits via rolling hash; a densidade cresce com o
+        conteúdo do pacote e satura em SDR_ACTIVE bits (≈2%, o ideal
+        biológico). Pacotes com conteúdo insuficiente (ex: "x") ficam abaixo
+        do mínimo e são bloqueados por Inibição Lateral — exatamente o
+        comportamento desejado para telemetria truncada/anômala.
+        """
+        active: List[int] = []
+        seen: Set[int] = set()
+        h = SDR_SEED & 0xFFFFFFFF
+        for i, byte in enumerate(raw):
+            h = self._xorshift(h + byte + (i * 0x9E3779B9))
+            for k in range(self.BITS_PER_BYTE):
+                bit = self._xorshift(h + k * 0x85EBCA6B) % self.sdr_size
+                if bit not in seen:
+                    seen.add(bit)
+                    active.append(bit)
+                    if len(active) >= SDR_ACTIVE:
+                        return active
+        return active
+
+    def compute_sparsity(self, data: Any) -> Tuple[float, List[int]]:
         """
         Calcula a densidade de bits de um pacote de entrada.
-        Retorna (sparsity, bit_vector).
+
+        Retorna (sparsity, active_bits) — onde active_bits é a lista de
+        índices ativos no SDR de sdr_size bits.
         """
         if isinstance(data, SparseSDR):
-            vec = data.to_numpy()
-        elif isinstance(data, np.ndarray):
-            vec = (data > 0).astype(np.uint8)
-            if len(vec) != self.sdr_size:
-                # Redimensiona via hash deterministico
-                padded = np.zeros(self.sdr_size, dtype=np.uint8)
-                n = min(len(vec), self.sdr_size)
-                padded[:n] = vec[:n]
-                vec = padded
+            active = sorted(set(int(i) for i in data.to_list() if 0 <= int(i) < self.sdr_size))
+        elif HAS_NUMPY and np is not None and isinstance(data, np.ndarray):
+            flat = data.reshape(-1).tolist() if data.ndim > 1 else data.tolist()
+            active = [i for i, v in enumerate(flat[:self.sdr_size]) if v > 0]
+        elif isinstance(data, (set, frozenset)) and all(
+                isinstance(v, (int, float)) and 0 <= v < self.sdr_size for v in data):
+            # Conjunto de índices ativos (SDR esparso "cru")
+            active = sorted({int(v) for v in data})
+        elif isinstance(data, (list, tuple)) and all(
+                isinstance(v, (int, float)) for v in data):
+            # Vetor numérico → posições não-nulas viram bits ativos
+            active = [i for i, v in enumerate(data[:self.sdr_size]) if v]
         else:
-            # Converte texto/bytes em vetor de bits via hash deterministico
+            # Texto/bytes (ou qualquer outro dado) → codificação determinística
             raw = data.encode("utf-8") if isinstance(data, str) else str(data).encode()
-            vec = np.zeros(self.sdr_size, dtype=np.uint8)
-            for i, b in enumerate(raw[:self.sdr_size]):
-                vec[int(hashlib.md5(f"{b}{i}".encode()).hexdigest(), 16) % self.sdr_size] = 1
-        active = int(np.sum(vec))
-        sparsity = active / self.sdr_size
-        return sparsity, vec
+            active = self._encode_text(raw)
+        sparsity = len(active) / float(self.sdr_size)
+        return sparsity, active
+
+    def mask_overlap(self, active: List[int]) -> float:
+        """Diagnóstico: fração da máscara mestra coberta pelo pacote (acaso ≈ sparsity)."""
+        return len(set(active) & self._master_set) / max(len(self._master_set), 1)
 
     def validate_packet(self, data: Any, source_id: str = "unknown") -> Tuple[bool, str]:
         """
-        Valida um pacote de entrada contra a máscara SDR mestra.
+        Valida um pacote de entrada (densidade + distribuição) contra o padrão SDR.
 
         Retorna (aceito: bool, mensagem: str).
         Se rejeitado, registra como intrusão e aplica Inibição Lateral.
         """
         self._total_packets += 1
-        sparsity, vec = self.compute_sparsity(data)
+        sparsity, active = self.compute_sparsity(data)
 
-        # Verifica se a densidade de bits está na faixa biológica saudável
+        # 1. Densidade de bits na faixa biológica saudável
         if not (self.min_sparsity <= sparsity <= self.max_sparsity):
             return self._lateral_inhibition(source_id, sparsity, "sparsity_out_of_range")
 
-        # Verifica sobreposição mínima com a máscara SDR mestra
-        overlap = float(np.sum(vec & self._master_mask)) / max(SDR_ACTIVE, 1)
-        if overlap < 0.01:  # menos de 1% de sobreposição com o padrão SDR
-            return self._lateral_inhibition(source_id, sparsity, "sdr_mask_mismatch")
+        # 2. Distribuição informativa: bits espalhados pelo espaço SDR.
+        #    Padrões concentrados/periódicos indicam payload truncado ou máscara
+        #    sintética — nunca telemetria/texto real do Nexus.
+        if len(active) >= 8:
+            span = max(active) - min(active)
+            if span < self.sdr_size // 4:
+                return self._lateral_inhibition(source_id, sparsity, "sdr_distribution_degenerate")
 
-        return True, f"[SDRFilter] ACEITO | sparsity={sparsity:.4f} | overlap={overlap:.4f}"
+        overlap = self.mask_overlap(active)
+        return True, (f"[SDRFilter] ACEITO | sparsity={sparsity:.4f} | "
+                      f"overlap={overlap:.4f} | bits={len(active)}")
 
     def _lateral_inhibition(self, source_id: str, sparsity: float, reason: str) -> Tuple[bool, str]:
         """Aplica Inibição Lateral: bloqueia e registra tentativa de intrusão."""
@@ -11814,11 +12163,12 @@ class NexusHealerV11:
         self._noise_history.append(sparsity)
 
     def detect_noise_spike(self) -> bool:
-        """Detecta pico de ruído usando variância numpy na janela deslizante."""
+        """Detecta pico de ruído pela variância da janela deslizante (numpy opcional)."""
         if len(self._noise_history) < 5:
             return False
-        arr = np.array(list(self._noise_history))
-        variance = float(np.var(arr))
+        vals = list(self._noise_history)
+        mean = sum(vals) / len(vals)
+        variance = sum((v - mean) ** 2 for v in vals) / len(vals)
         return variance > self.NOISE_THRESHOLD
 
     async def heal(self, context: str = "auto") -> Dict:
@@ -11897,14 +12247,16 @@ class NexusHealerV11:
 
     @property
     def stats(self) -> Dict:
-        arr = np.array(list(self._noise_history)) if self._noise_history else np.array([0.0])
+        vals = list(self._noise_history) or [0.0]
+        mean = sum(vals) / len(vals)
+        var  = sum((v - mean) ** 2 for v in vals) / len(vals)
         return {
             "heal_count":  self._heal_count,
             "flush_count": self._flush_count,
             "scan_count":  self._scan_count,
             "threshold":   round(self.threshold, 4),
-            "noise_mean":  round(float(np.mean(arr)), 4),
-            "noise_var":   round(float(np.var(arr)), 6),
+            "noise_mean":  round(mean, 4),
+            "noise_var":   round(var, 6),
         }
 
 
@@ -11932,8 +12284,27 @@ class NexusDomainProcessor:
         self.fact_store  = SQLiteFactStoreV12()
         self._processed  = 0
         self._rejected   = 0
+        self._sdr_cache: Dict[str, 'SparseSDR'] = {}   # fato → SDR (busca por proximidade)
         self.buffer: asyncio.Queue = asyncio.Queue(maxsize=256)
         healer.register_buffer(self.buffer)
+
+    def search_facts(self, query: str, top_k: int = 3) -> List[Tuple[float, str]]:
+        """
+        Busca fatos do domínio por similaridade SDR (Jaccard) com fallback
+        léxico (FTS5) quando o fato ainda não tem SDR cacheado.
+        Retorna [(score, fato), ...] ordenado por score desc.
+        """
+        q_sdr = self.encoder.encode(query, context=self.domain_id)
+        scored: List[Tuple[float, str]] = []
+        for fact, sdr in self._sdr_cache.items():
+            j = q_sdr.jaccard(sdr)
+            if j > 0.0:
+                scored.append((j, fact))
+        if not scored:
+            return [(0.0, f) for f in self.fact_store.search(query, top_k=top_k)
+                    if f in self._sdr_cache]
+        scored.sort(key=lambda x: -x[0])
+        return scored[:top_k]
 
     async def process_packet(self, sensor_id: str, data: Any) -> Dict:
         """
@@ -11969,8 +12340,10 @@ class NexusDomainProcessor:
         text_repr = str(data) if not isinstance(data, str) else data
         sdr = self.encoder.encode(text_repr, context=self.domain_id)
 
-        # 3. Adiciona ao FactStore local
-        self.fact_store.add_fact(text_repr, sdr, domain=self.domain_id)
+        # 3. Adiciona ao FactStore local do domínio (SQLiteFactStoreV12)
+        #    + cache do SDR para busca por proximidade dentro do domínio
+        self.fact_store.add(text_repr)
+        self._sdr_cache[text_repr] = sdr
 
         # 4. Persiste telemetria
         await self.persist.log_telemetry(
@@ -12055,14 +12428,24 @@ class NexusDomainBus:
         for domain_id, sensor_id, data in packets:
             proc = self._domains.get(domain_id)
             if proc is None:
-                tasks.append(asyncio.coroutine(
-                    lambda: {"status": "ERROR", "reason": f"domínio desconhecido: {domain_id}"}
-                )())
+                # Domínio desconhecido: retorna erro estruturado (não levanta exceção)
+                # sem interromper o processamento concorrente dos demais domínios.
+                tasks.append(self._unknown_domain_result(domain_id, sensor_id))
             else:
                 tasks.append(proc.process_packet(sensor_id, data))
 
         results = await asyncio.gather(*tasks, return_exceptions=False)
         return list(results)
+
+    @staticmethod
+    async def _unknown_domain_result(domain_id: str, sensor_id: str) -> Dict:
+        """Resultado padrão para pacotes endereçados a domínios inexistentes."""
+        return {
+            "status": "ERROR",
+            "domain": domain_id,
+            "sensor": sensor_id,
+            "reason": f"domínio desconhecido: {domain_id}",
+        }
 
     async def process_domain(self, domain_id: str, sensor_id: str, data: Any) -> Dict:
         """Processa um único pacote em um domínio específico."""
@@ -12272,6 +12655,7 @@ class NexusKernelV11_2:
         # Estado interno
         self._startup_done = False
         self._session_facts = 0
+        self._sdr_cache: Dict[str, 'SparseSDR'] = {}   # fato → SDR (busca por proximidade)
 
         print("╚══ Subsistemas carregados: Guard, Persist, SDRFilter, Healer, Bus ══╝\n")
 
@@ -12324,21 +12708,32 @@ class NexusKernelV11_2:
     def learn(self, fact: str, domain: str = "general") -> str:
         """Aprende um fato e o armazena no FactStore com SDR."""
         clean = self.auditor.purificar(fact)
+        if not clean:
+            return "[Nexus] Nada a aprender — fato vazio."
         sdr = self.encoder.encode(clean, context=domain)
         if not sdr.bit_density_valid():
             return f"[Guard] Fato rejeitado — densidade SDR inválida: {sdr.sparsity():.4f}"
-        self.fact_store.add_fact(clean, sdr, domain=domain)
+        self.fact_store.add(clean)          # SQLiteFactStoreV12: add(fact) → bool
+        self._sdr_cache[clean] = sdr
         self._session_facts += 1
         return f"[Nexus] Aprendi: '{clean[:60]}' | SDR bits={len(sdr)} | domain={domain}"
 
     def query(self, question: str, top_k: int = 3) -> str:
-        """Consulta o FactStore por sobreposição SDR."""
-        sdr = self.encoder.encode(question)
-        results = self.fact_store.search(sdr, top_k=top_k, min_score=0.05)
-        if not results:
-            return f"[Nexus] Não encontrei informações sobre: '{question}'"
-        lines = [f"• [{score:.3f}] {fact[:100]}" for score, fact in results]
-        return "\n".join(lines)
+        """Consulta o FactStore por similaridade SDR (Jaccard) + fallback FTS5."""
+        q_sdr = self.encoder.encode(question)
+        scored = []
+        for fact, sdr in self._sdr_cache.items():
+            j = q_sdr.jaccard(sdr)
+            if j > 0.0:
+                scored.append((j, fact))
+        if not scored:
+            # Fallback: busca léxica do FactStore — score derivado da sigmoide FTS
+            hits = self.fact_store.search(question, top_k=top_k, min_score=0.2)
+            if not hits:
+                return f"[Nexus] Não encontrei informações sobre: '{question}'"
+            return "\n".join(f"• {fact[:120]}" for fact in hits)
+        scored.sort(key=lambda x: -x[0])
+        return "\n".join(f"• [{score:.3f}] {fact[:120]}" for score, fact in scored[:top_k])
 
     def chat(self, text: str) -> str:
         """Interface conversacional principal."""
@@ -12561,6 +12956,7 @@ class NexusV14Unified:
                 pass
         
         self._production_started = False
+        self._production_pending = False   # startup adiado (loop já rodando)
         self._verbose = verbose
         
         if verbose:
@@ -12575,9 +12971,27 @@ class NexusV14Unified:
             print(f"╚══════════════════════════════════════════╝")
         
         if production:
-            import asyncio
-            asyncio.get_event_loop().run_until_complete(self.startup_production())
-    
+            self._start_production_in_sync_context()
+
+    def _start_production_in_sync_context(self) -> None:
+        """
+        Inicializa a camada de produção a partir de um construtor SÍNCRONO.
+
+        Se já houver um event loop rodando (notebook, servidor ASGI), não é
+        possível bloquear: a inicialização é marcada como pendente e o
+        primeiro `await` em process_iot/broadcast_iot a executa. Caso
+        contrário, roda o loop até completar.
+        """
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            asyncio.run(self.startup_production())
+        else:
+            self._production_pending = True
+            if self._verbose:
+                print('[NexusV14] Event loop ativo — produção será inicializada '
+                      'no primeiro await de process_iot/broadcast_iot.')
+
     # ── Interface Cognitiva ────────────────────────────────────────
     
     def chat(self, text: str) -> str:
@@ -12588,6 +13002,14 @@ class NexusV14Unified:
         """Aprende um fato (V10 + propagação cross-domain)."""
         return self.cognitive.learn(fact)
     
+    def status(self) -> Dict:
+        """Status estruturado do núcleo cognitivo (delegação ao GlobalWorkspace)."""
+        return self.cognitive.status()
+
+    def save(self, path: Optional[str] = None) -> None:
+        """Persiste o estado cognitivo em disco (JSON)."""
+        self.cognitive.save(path)
+
     def scan_health(self) -> str:
         """Relatório de saúde completo (V10 + V11.2)."""
         health = self.cognitive.scan_health()
@@ -12621,12 +13043,14 @@ class NexusV14Unified:
         """Processa pacote IoT com validação SDR + persistência."""
         if not self._production_started:
             await self.startup_production()
+        self._production_pending = False
         return await self.domain_bus.process_domain(domain_id, sensor_id, data)
     
     async def broadcast_iot(self, packets: List[Tuple[str, str, Any]]) -> List[Dict]:
         """Processa múltiplos pacotes concorrentemente (asyncio.gather)."""
         if not self._production_started:
             await self.startup_production()
+        self._production_pending = False
         return await self.domain_bus.broadcast(packets)
     
     def encrypt(self, data: Any) -> str:
@@ -12763,9 +13187,20 @@ def run_v14_selftest(verbose: bool = True) -> bool:
     
     # 3. SDR Filter
     if verbose: print('\n[3] SDR Filter')
-    sdr = SparseSDR(list(range(0, 160, 2)))  # 80 bits ativos = 2% sparsity
+    # SDR real produzido pelo encoder (2% de densidade, bits distribuídos)
+    sdr = MultiLobeEncoder().encode("pacote válido de telemetria do sensor")
     accepted, msg = n.sdr_filter.validate_packet(sdr, "test")
     chk('SDR válido aceito', accepted, msg[:50])
+
+    # Máscara periódica degenerada (bits só nos primeiros 160, espaçamento 2)
+    # deve ser bloqueada por Inibição Lateral — é payload sintético, não sinal.
+    bad_sdr = SparseSDR(list(range(0, 160, 2)))
+    rejected, bad_msg = n.sdr_filter.validate_packet(bad_sdr, "test")
+    chk('Padrão degenerado bloqueado', not rejected, bad_msg[:50])
+
+    # Telemetria truncada (1 byte) fica abaixo da densidade mínima
+    truncated, trunc_msg = n.sdr_filter.validate_packet("x", "test")
+    chk('Pacote truncado bloqueado', not truncated, trunc_msg[:50])
     
     # 4. Sensorial
     if verbose: print('\n[4] Encoders Sensoriais')
@@ -12802,64 +13237,120 @@ def run_v14_selftest(verbose: bool = True) -> bool:
 # ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
 
-if __name__ == '__main__':
+# ══════════════════════════════════════════════════════════════════════════════
+# §CLI  PONTO DE ENTRADA ÚNICO
+# ══════════════════════════════════════════════════════════════════════════════
+
+_USAGE = """\
+NEXUS V14 UNIFIED — Sistema Cognitivo de Missão Crítica
+
+Uso:
+  python nexus_v14_shared_hippocampus.py                 modo interativo (chat)
+  python nexus_v14_shared_hippocampus.py --demo          demo completo (cognitivo + IoT + sensorial)
+  python nexus_v14_shared_hippocampus.py --production    demo do kernel de produção V11.2
+  python nexus_v14_shared_hippocampus.py --gw            chat com Global Workspace (multi-cérebros)
+  python nexus_v14_shared_hippocampus.py --test          suite completa de testes (V14 + V10)
+  python nexus_v14_shared_hippocampus.py --v10-test      testes do núcleo V10 (rápido)
+  python nexus_v14_shared_hippocampus.py --health        relatório de saúde do sistema
+  python nexus_v14_shared_hippocampus.py --serve [porta] servidor HTTP (REST + UI) — requer fastapi
+  python nexus_v14_shared_hippocampus.py --selfcheck     checa dependências opcionais (numpy/aiosqlite/fastapi)
+  python nexus_v14_shared_hippocampus.py --help          esta ajuda
+"""
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """Dispatcher único da CLI. Retorna o exit code do processo."""
     import sys as _sys
-    
-    print('='*65)
-    print('  NEXUS V14 UNIFIED — Sistema Cognitivo de Missão Crítica')
-    print('='*65)
-    
-    if '--test' in _sys.argv:
-        # Teste rápido
-        ok = run_v14_selftest(verbose=True)
-        
-        # Também roda testes V10
-        print('\n\n--- Testes V10 (cognitivos) ---')
+    argv = list(_sys.argv[1:] if argv is None else argv)
+
+    if not argv:
+        n = NexusV14Unified(verbose=True)
+        _cli_interactive(n, {
+            'status': n.scan_health,
+            'saúde':  n.scan_health,
+            'health': n.scan_health,
+            'brains': n.cognitive.brain_status,
+        })
+        return 0
+
+    cmd, rest = argv[0], argv[1:]
+
+    if cmd in ('--help', '-h', 'help'):
+        print(_USAGE)
+        return 0
+
+    if cmd == '--test':
+        print('=' * 65)
+        print('  NEXUS V14 UNIFIED — Suite de Testes')
+        print('=' * 65)
+        ok_v14 = run_v14_selftest(verbose=True)
+        print('\n\n--- Testes cognitivos (V10 + Global Workspace) ---')
         try:
-            ok2 = run_nexus_tests(verbose=True)
+            ok_v10 = run_nexus_tests(verbose=True)
         except Exception as e:
-            print(f'  [SKIP] Testes V10: {e}')
-            ok2 = True
-        
-        _sys.exit(0 if ok and ok2 else 1)
-    
-    elif '--demo' in _sys.argv:
+            print(f'  [SKIP] Testes cognitivos: {e}')
+            ok_v10 = True
+        print('\n\n--- Testes básicos do núcleo V10 ---')
+        ok_basic = _cli_v10_basic_tests()
+        passed = ok_v14 and ok_v10 and ok_basic
+        print('\n' + '=' * 65)
+        print('  RESULTADO FINAL: ' + ('✅ TODOS OS TESTES PASSARAM' if passed
+                                        else '✗ HOUVE FALHAS'))
+        print('=' * 65)
+        return 0 if passed else 1
+
+    if cmd == '--v10-test':
+        return 0 if _cli_v10_basic_tests() and _cli_final_suite() else 1
+
+    if cmd == '--demo':
         n = NexusV14Unified(verbose=True)
         asyncio.run(n.run_full_demo())
-    
-    elif '--production' in _sys.argv:
-        # Modo produção com kernel V11.2
+        return 0
+
+    if cmd == '--production':
         kernel = NexusKernelV11_2()
         asyncio.run(kernel.run_demo())
-    
-    elif '--gw' in _sys.argv:
-        # Modo GlobalWorkspace interativo
+        return 0
+
+    if cmd == '--health':
+        n = NexusV14Unified()
+        n.learn('a fotossíntese converte luz solar em glicose usando clorofila')
+        print(n.scan_health())
+        return 0
+
+    if cmd == '--gw':
         n = NexusV14Unified(verbose=True)
         print(f'\n{n.cognitive.brain_status()}')
-        print('\nDigite "sair" para encerrar.')
-        while True:
-            try:
-                user = input('> ').strip()
-            except (EOFError, KeyboardInterrupt):
-                break
-            if not user: continue
-            if user.lower() in ('sair','exit','quit'): break
-            if user.lower() in ('saúde','health','status'):
-                print(n.scan_health())
-            elif user.lower() == 'brains':
-                print(n.cognitive.brain_status())
-            else:
-                print(n.chat(user))
-    
-    else:
-        # Modo interativo padrão
-        n = NexusV14Unified(verbose=True)
-        print('\nDigite "sair" para encerrar.')
-        while True:
-            try:
-                user = input('> ').strip()
-            except (EOFError, KeyboardInterrupt):
-                break
-            if not user: continue
-            if user.lower() in ('sair','exit','quit'): break
-            print(n.chat(user))
+        _cli_interactive(n, {
+            'status': n.scan_health,
+            'saúde':  n.scan_health,
+            'health': n.scan_health,
+            'brains': n.cognitive.brain_status,
+        })
+        return 0
+
+    if cmd == '--serve':
+        port = int(rest[0]) if rest and rest[0].isdigit() else 8000
+        try:
+            from nexus_server import serve
+        except ImportError:
+            print('Servidor HTTP indisponível: instale as dependências do servidor\n'
+                  '  pip install -r requirements-server.txt')
+            return 2
+        serve(port=port)
+        return 0
+
+    if cmd == '--selfcheck':
+        # Verificação de importação/instalação usada por CI e pelo usuário final
+        print(f'nexus {VERSION} | numpy={"sim" if HAS_NUMPY else "não"} | '
+              f'aiosqlite={"sim" if _AIOSQLITE_OK else "não"} | '
+              f'fastapi={"sim" if _HAS_FASTAPI else "não"}')
+        return 0
+
+    print(f'Comando desconhecido: {cmd}\n')
+    print(_USAGE)
+    return 2
+
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -1,0 +1,31 @@
+# ── Estado de runtime do Nexus (nunca versionar) ──────────────────────────────
+nexus_state.json
+nexus_context.json
+nexus_global.json
+nexus_secure.db
+nexus_iot_final.db
+*.db-journal
+*.db-wal
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.env
+
+# ── Testes / cobertura ────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# ── Editores / SO ─────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+.DS_Store

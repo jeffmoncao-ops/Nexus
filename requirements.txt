@@ -1,0 +1,12 @@
+# ── NEXUS V14 UNIFIED — dependências do KERNEL ────────────────────────────────
+# NENHUMA é obrigatória: o kernel roda em Python puro (>= 3.9) com fallbacks
+# para todos os subsistemas. Instalar as opcionais habilita as otimizações.
+#
+#   pip install -r requirements.txt
+#
+# numpy      → aceleração vetorial (~10x) do MiniEmbed, encoders sensoriais,
+#              variância do healer. Sem ele: fallback Python puro.
+# aiosqlite  → persistência assíncrona real (nexus_secure.db, nexus_iot_final.db).
+#              Sem ele: modo de simulação (escritas são logadas, não persistidas).
+numpy>=1.24 ; python_version < "3.13"
+aiosqlite>=0.19
