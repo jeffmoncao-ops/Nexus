@@ -4,6 +4,8 @@ nexus_context.json
 nexus_global.json
 nexus_secure.db
 nexus_iot_final.db
+nexus_provenance.db
+*.db
 *.db-journal
 *.db-wal
 

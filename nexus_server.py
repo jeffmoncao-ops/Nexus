@@ -21,6 +21,10 @@ Expõe o kernel cognitivo Nexus V14 como serviço HTTP:
   GET  /api/domains           estatísticas dos domínios IoT
   POST /api/crypto            {text, mode: encrypt|decrypt} → NexusGuardV11
   POST /api/code              {request} → geração de código (CodeGeneralizer)
+  POST /api/ingest            {text, source?, confidence?} → ingestão de corpus
+  GET  /api/provenance        origem/confiança dos fatos (amostra + resumo)
+  POST /api/explain           {fact} → de onde veio este fato
+  POST /api/coverage          {query} → quanto o sistema sabe sobre o tema
   POST /api/sensory/image     {image?, size?} → SDR visual (V13)
   POST /api/sensory/audio     {frequency?, seconds?} → SDR auditivo (V13)
 
@@ -89,7 +93,7 @@ def _seed_remote_knowledge(k: NexusV14Unified) -> None:
     ]
     for fact in base:
         try:
-            k.learn(fact)
+            k.learn(fact, source="seed")
         except Exception:
             pass
 
@@ -105,6 +109,9 @@ class ChatIn(BaseModel):
 class LearnIn(BaseModel):
     fact: str = Field(..., min_length=2, max_length=4000)
     domain: Optional[str] = None
+    source: Optional[str] = Field("user", max_length=100)
+    confidence: Optional[float] = Field(None, ge=0.0, le=1.0)
+    evidence: str = Field("", max_length=500)
 
 
 class DocumentIn(BaseModel):
@@ -130,6 +137,21 @@ class CryptoIn(BaseModel):
 
 class CodeIn(BaseModel):
     request: str = Field(..., min_length=2, max_length=2000)
+
+
+class ExplainIn(BaseModel):
+    fact: str = Field(..., min_length=2, max_length=2000)
+
+
+class CoverageIn(BaseModel):
+    query: str = Field(..., min_length=1, max_length=2000)
+
+
+class IngestIn(BaseModel):
+    text: str = Field(..., min_length=10, max_length=500_000)
+    source: str = Field("ingest", max_length=200)
+    confidence: float = Field(0.85, ge=0.0, le=1.0)
+    evidence: str = Field("", max_length=500)
 
 
 class ImageIn(BaseModel):
@@ -234,7 +256,8 @@ def chat(payload: ChatIn) -> Dict[str, Any]:
 def learn(payload: LearnIn) -> Dict[str, Any]:
     k = get_kernel()
     with _lock:
-        result = k.learn(payload.fact)
+        result = k.learn(payload.fact, source=payload.source or "user",
+                         confidence=payload.confidence, evidence=payload.evidence)
         if payload.domain:
             brain = k.cognitive._brains.get(payload.domain)
             if brain is not None:
@@ -248,8 +271,51 @@ def learn(payload: LearnIn) -> Dict[str, Any]:
 def learn_document(payload: DocumentIn) -> Dict[str, Any]:
     k = get_kernel()
     with _lock:
-        learned = k.cognitive.learn_document(payload.text)
+        learned = k.cognitive.learn_document(payload.text, source="document")
     return {"learned": learned}
+
+
+@app.post("/api/ingest")
+def ingest(payload: IngestIn) -> Dict[str, Any]:
+    """Ingere um bloco de texto com dedup + proveniência (pipeline nexus_ingest)."""
+    import nexus_ingest
+    k = get_kernel()
+    with _lock:
+        metricas = nexus_ingest.ingest_text(
+            k, payload.text, source=payload.source,
+            confidence=payload.confidence, evidence=payload.evidence)
+        prov = k.provenance_report()
+    return {"ingest": metricas, "provenance": prov}
+
+
+@app.get("/api/provenance")
+def provenance(source: Optional[str] = None, min_confidence: float = 0.0,
+               limit: int = 50) -> Dict[str, Any]:
+    """Resumo (e amostra) da proveniência: de onde vem cada fato."""
+    k = get_kernel()
+    with _lock:
+        report = k.provenance_report()
+        amostra = [p.to_dict() for p in
+                   k.cognitive.provenance.all(source=source,
+                                              min_confidence=min_confidence,
+                                              limit=limit)]
+    return {"report": report, "sample": amostra}
+
+
+@app.post("/api/explain")
+def explain(payload: ExplainIn) -> Dict[str, Any]:
+    """De onde veio este fato? (origem, confiança, evidência, usos)"""
+    k = get_kernel()
+    with _lock:
+        return k.explain(payload.fact)
+
+
+@app.post("/api/coverage")
+def coverage(payload: CoverageIn) -> Dict[str, Any]:
+    """Quanto o sistema sabe sobre a consulta? (score, lacunas, cobertura)"""
+    k = get_kernel()
+    with _lock:
+        return k.cognitive._core.estimate_coverage(payload.query)
 
 
 @app.post("/api/search")
@@ -460,6 +526,7 @@ _INDEX_HTML = r"""<!DOCTYPE html>
     <span class="pill">brains <b id="p-brains">0</b></span>
     <span class="pill">turnos <b id="p-turns">0</b></span>
     <span class="pill">uptime <b id="p-uptime">0s</b></span>
+    <span class="pill">origens <b id="p-prov">0</b></span>
   </div>
 </header>
 
@@ -548,6 +615,29 @@ _INDEX_HTML = r"""<!DOCTYPE html>
       <span class="tag">número primo</span>
     </div>
     <pre id="code-out">—</pre>
+  </section>
+
+  <section class="card">
+    <h2>Conhecimento — ingestão e proveniência</h2>
+    <div class="row">
+      <select id="ingest-source">
+        <option value="ingest">ingest (corpus)</option>
+        <option value="document">document</option>
+        <option value="user">user</option>
+        <option value="wikipedia">wikipedia</option>
+      </select>
+      <input id="ingest-evidence" placeholder="evidência (arquivo/URL)" value="">
+    </div>
+    <div class="row">
+      <textarea id="ingest-text" rows="3"
+        placeholder="Cole um texto: cada sentença vira um fato e duplicatas são ignoradas."></textarea>
+      <button onclick="doIngest()">Ingerir</button>
+    </div>
+    <div class="row">
+      <input id="explain-input" placeholder="de onde veio o fato? ex: mitocôndria" autocomplete="off">
+      <button class="ghost" onclick="doExplain()">Explicar origem</button>
+    </div>
+    <pre id="prov-out">—</pre>
   </section>
 
   <section class="card" style="grid-column:1/-1">
@@ -663,6 +753,39 @@ async function doCode(){
   }catch(e){ $('code-out').textContent = 'erro: ' + e.message; }
 }
 
+async function doIngest(){
+  const text = $('ingest-text').value.trim();
+  if(!text) return;
+  try{
+    const d = await api('/api/ingest', {
+      text, source: $('ingest-source').value,
+      evidence: $('ingest-evidence').value || ''
+    });
+    const m = d.ingest, p = d.provenance || {};
+    $('prov-out').textContent =
+      'ingestão: ' + m.new + ' fatos novos, ' + m.duplicates + ' duplicados de '
+      + m.facts_found + ' candidatos\n'
+      + 'proveniência: ' + (p.tracked || 0) + ' fatos rastreados ('
+      + Math.round((p.coverage || 0) * 100) + '% de cobertura)\n'
+      + 'fontes: ' + Object.entries(p.sources || {})
+          .map(([k, v]) => k + '=' + v.facts).join(', ');
+  }catch(e){ $('prov-out').textContent = 'erro: ' + e.message; }
+  refresh();
+}
+
+async function doExplain(){
+  const fact = $('explain-input').value.trim();
+  if(!fact) return;
+  try{
+    const d = await api('/api/explain', {fact});
+    $('prov-out').textContent = d.known
+      ? fact + '\n  origem     : ' + d.source + '\n  confiança  : ' + d.confidence
+        + '\n  evidência  : ' + (d.evidence || '—') + '\n  usos       : ' + d.accesses
+        + '\n  fato       : ' + d.fact
+      : fact + '\n  sem registro de origem (' + (d.hint || '') + ')';
+  }catch(e){ $('prov-out').textContent = 'erro: ' + e.message; }
+}
+
 async function refresh(){
   try{
     const [st, br, he] = await Promise.all([api('/api/status'), api('/api/brains'), api('/api/health')]);
@@ -671,6 +794,11 @@ async function refresh(){
     $('p-turns').textContent  = st.turns;
     $('p-uptime').textContent = st.uptime_s + 's';
     $('p-status').textContent = 'online';
+    try{
+      const pv = await api('/api/provenance');
+      $('p-prov').textContent = pv.report.tracked
+        + ' (' + Math.round((pv.report.coverage || 0) * 100) + '%)';
+    }catch(e){ /* proveniência é opcional na UI */ }
     $('brains-body').innerHTML = br.brains.map(b =>
       '<tr><td>' + esc(b.name) + ' <span class="sub">(' + esc(b.id) + ')</span></td>' +
       '<td>' + b.facts + '</td><td>' + b.learned + '</td><td>' + b.queries + '</td></tr>').join('');
@@ -683,6 +811,7 @@ async function refresh(){
 $('chat-input').addEventListener('keydown', e => { if(e.key === 'Enter') sendChat(); });
 $('search-input').addEventListener('keydown', e => { if(e.key === 'Enter') doSearch(); });
 $('code-input').addEventListener('keydown', e => { if(e.key === 'Enter') doCode(); });
+$('explain-input').addEventListener('keydown', e => { if(e.key === 'Enter') doExplain(); });
 push('nx', 'Kernel online. Pergunte algo — se eu não souber, eu admito e peço para aprender.');
 refresh();
 setInterval(refresh, 15000);

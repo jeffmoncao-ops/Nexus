@@ -24,6 +24,7 @@ Camadas expostas:
 
   Cognitiva (V10)      : NexusV10, GlobalWorkspaceNexus, MiniEmbed, SparseSDR,
                          ConceptGraph, TextWeaver, MathEngine, CodeGeneralizer…
+  Proveniência         : ProvenanceStore, FactProvenance, SOURCE_CONFIDENCE
   Produção (V11.2)     : NexusGuardV11, NexusPersistV11, NexusSDRFilter,
                          NexusHealerV11, NexusDomainBus, NexusKernelV11_2…
   Evolução (V13)       : VecOps, VisualEncoder, AudioEncoder, MiniEmbedAccelerator
@@ -43,6 +44,10 @@ from nexus_v14_shared_hippocampus import (                     # noqa: F401
     # ── Núcleo unificado ────────────────────────────────────────────────────
     NexusV14Unified,
     VERSION,
+    # ── Proveniência de fatos ───────────────────────────────────────────────
+    ProvenanceStore,
+    FactProvenance,
+    SOURCE_CONFIDENCE,
     # ── Cognitivo (V10) ─────────────────────────────────────────────────────
     SparseSDR,
     MiniEmbed,
@@ -130,6 +135,8 @@ __all__ = [
     'SDR_SIZE', 'SDR_ACTIVE', 'SDR_SEED', 'SDR_SPARSITY_MIN',
     'SDR_SPARSITY_MAX', 'SDR_SPARSITY_IDEAL', 'DB_SECURE', 'DB_IOT',
     'HAS_NUMPY', 'run_v14_selftest', 'run_nexus_tests',
+    # Proveniência
+    'ProvenanceStore', 'FactProvenance', 'SOURCE_CONFIDENCE',
 ]
 
 

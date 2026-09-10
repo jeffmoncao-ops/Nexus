@@ -46,7 +46,7 @@
 
 from __future__ import annotations
 
-import array, ast, asyncio, contextlib, hashlib, io, json, math, os, re, sys
+import array, ast, asyncio, base64, contextlib, hashlib, io, json, math, os, re, sqlite3, sys
 import atexit, struct, threading, time, unicodedata, random
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
@@ -94,6 +94,42 @@ ZONE_SEMANTIC = (0,    2048)
 ZONE_CONTEXT  = (2048, 3072)
 ZONE_VALENCE  = (3072, 4096)
 ZONE_ACTIVE   = (30, 25, 25)   # bits por zona (total = 80)
+
+# ── Serialização compacta de vetores densos ──────────────────────────────────
+# Word vectors em JSON puro ocupam ~20 chars por float (repr de 17 dígitos):
+# 4 vetores × 768 dims × N tokens → dezenas de MB. Codificamos cada vetor como
+# base64 de float32 (array('f')), preservando a precisão útil das embeddings
+# (≈1e-7 relativo) com 4 bytes por dimensão e sem dependências externas.
+_VEC_FMT_KEY = 'vec_fmt'
+_VEC_FMT_F32B64 = 'f32b64'
+
+
+def _pack_vec(vec) -> str:
+    """lista de floats → base64(float32)."""
+    return base64.b64encode(array.array('f', [float(x) for x in vec]).tobytes()).decode('ascii')
+
+
+def _unpack_vec(blob: str, dim: Optional[int] = None) -> List[float]:
+    """base64(float32) → lista de floats."""
+    raw = array.array('f')
+    raw.frombytes(base64.b64decode(blob.encode('ascii')))
+    out = [float(x) for x in raw]
+    if dim is not None and len(out) < dim:
+        out.extend([0.0] * (dim - len(out)))
+    return out
+
+
+def _pack_vec_map(vecs: Dict[str, List[float]]) -> Dict[str, str]:
+    return {w: _pack_vec(v) for w, v in vecs.items()}
+
+
+def _unpack_vec_map(data: dict, dim: int) -> Dict[str, List[float]]:
+    """Aceita o formato compacto (str base64) OU o legado (lista de floats)."""
+    out: Dict[str, List[float]] = {}
+    for w, v in (data or {}).items():
+        out[w] = _unpack_vec(v, dim) if isinstance(v, str) else list(v)
+    return out
+
 
 _STOP_PT: frozenset = frozenset({
     "o","a","os","as","um","uma","uns","umas","que","é","de","do","da",
@@ -1111,16 +1147,19 @@ class MiniEmbed:
         return len(self._vocab)
 
     def to_dict(self) -> dict:
+        """Serializa o estado. Vetores vão em base64(float32) — ~4x menor que a
+        lista de floats em JSON, sem perda relevante (erro relativo ~1e-7)."""
         cooc_ser = {f'{k[0]}|{k[1]}': v for k, v in self._cooc.items()}
         return {'dim': self.DIM,
                 'cooc': cooc_ser, 'freq': dict(self._freq),
                 'total_pairs': self._total_pairs,
                 'total_tokens': self._total_tokens,
                 'vocab': list(self._vocab),
-                'ctx_vec':    {w: v for w, v in self._ctx_vec.items()},
-                'drift_vec':  {w: v for w, v in self._drift_vec.items()},
-                'input_vec':  {w: v for w, v in self._input_vec.items()},
-                'output_vec': {w: v for w, v in self._output_vec.items()},
+                _VEC_FMT_KEY: _VEC_FMT_F32B64,
+                'ctx_vec':    _pack_vec_map(self._ctx_vec),
+                'drift_vec':  _pack_vec_map(self._drift_vec),
+                'input_vec':  _pack_vec_map(self._input_vec),
+                'output_vec': _pack_vec_map(self._output_vec),
                 'updates':    self._updates}
 
     @classmethod
@@ -1138,10 +1177,11 @@ class MiniEmbed:
         me._total_pairs  = d.get('total_pairs', 0)
         me._total_tokens = d.get('total_tokens', 0)
         me._vocab        = set(d.get('vocab', []))
-        me._ctx_vec      = {w: list(v) for w, v in d.get('ctx_vec', {}).items()}
-        me._drift_vec    = {w: list(v) for w, v in d.get('drift_vec', {}).items()}
-        me._input_vec    = {w: list(v) for w, v in d.get('input_vec', {}).items()}
-        me._output_vec   = {w: list(v) for w, v in d.get('output_vec', {}).items()}
+        # Compatível com o formato compacto (f32+b64) e com o legado (listas)
+        me._ctx_vec      = _unpack_vec_map(d.get('ctx_vec', {}), me.DIM)
+        me._drift_vec    = _unpack_vec_map(d.get('drift_vec', {}), me.DIM)
+        me._input_vec    = _unpack_vec_map(d.get('input_vec', {}), me.DIM)
+        me._output_vec   = _unpack_vec_map(d.get('output_vec', {}), me.DIM)
         me._updates      = d.get('updates', 0)
         me._ns_dirty     = True
         return me
@@ -4567,9 +4607,16 @@ class FluentMouth:
                 extra = ''
         if extra:
             tpl = _rng.choice(_TEMPLATES['fact_multi'])
-            return tpl.format(main=text, extra=extra)
+            main = text if text.rstrip().endswith(('.', '!', '?', '…')) else text.rstrip() + '.'
+            return self._dedup_punct(tpl.format(main=main, extra=extra))
         tpl = _rng.choice(_TEMPLATES['fact'])
-        return tpl.format(text=text)
+        return self._dedup_punct(tpl.format(text=text))
+
+    @staticmethod
+    def _dedup_punct(s: str) -> str:
+        """Ajusta pontuação quando o fato já vem pontuado do corpus."""
+        s = re.sub(r'[.!?]+\s*—', ' —', s)          # "fato. — comentário" → "fato — comentário"
+        return re.sub(r'([.!?])\1+\s*$', r'\1', s)  # "fato.." → "fato."
 
     def speak_conflict(self, existing: str, hyp: str) -> str:
         tpl = _rng.choice(_TEMPLATES['conflict'])
@@ -6662,6 +6709,192 @@ class AttentionPool:
 
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# §24b  PROVENIÊNCIA DE FATOS — origem, confiança, evidência e uso
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Confiança padrão por origem do conhecimento. Não é uma medida de verdade —
+# é um indicador de quão verificável é a fonte (um fato do usuário vale mais
+# do que um trecho de resumo automático da Wikipedia).
+SOURCE_CONFIDENCE: Dict[str, float] = {
+    'user':      0.95,   # ensinado explicitamente pelo usuário
+    'chat':      0.90,   # "aprenda: …" no diálogo
+    'document':  0.85,   # extraído de documento fornecido
+    'wikipedia': 0.80,   # resumo automático de fonte externa
+    'seed':      0.90,   # conhecimento de bootstrap do próprio projeto
+    'ingest':    0.85,   # pipeline de ingestão (nexus_ingest.py)
+    'legacy':    0.50,   # fato pré-existente, sem registro de origem
+}
+
+_UNKNOWN_SOURCE_CONF = 0.60
+
+
+@dataclass
+class FactProvenance:
+    """Metadados de origem de um fato."""
+    fact:        str
+    source:      str
+    confidence:  float = 1.0
+    evidence:    str = ''
+    added_at:    float = field(default_factory=time.time)
+    accesses:    int = 0
+    last_access: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {'fact': self.fact, 'source': self.source,
+                'confidence': round(self.confidence, 3), 'evidence': self.evidence,
+                'added_at': self.added_at, 'accesses': self.accesses,
+                'last_access': self.last_access}
+
+
+class ProvenanceStore:
+    """
+    Registro de proveniência: para cada fato, de onde ele veio, com que
+    confiança e quantas vezes foi usado.
+
+    Armazenamento em SQLite (stdlib) — `:memory:` por padrão, para que a
+    criação de um kernel não escreva nada em disco sem pedido explícito.
+    Use `set_provenance_path('nexus_provenance.db')` para persistir.
+
+    Por que existe: sem proveniência, todo fato é igual — um boato digitado
+    por engano tem o mesmo peso de um dado de sensor validado. Com ela, o
+    sistema (e quem o audita) consegue distinguir, filtrar por confiança
+    mínima e responder "de onde você tirou isso?".
+    """
+
+    def __init__(self, path: str = ':memory:'):
+        self.path = path
+        self._lock = threading.RLock()
+        self._conn = sqlite3.connect(path, check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        with self._lock:
+            self._conn.execute(
+                """CREATE TABLE IF NOT EXISTS fact_provenance (
+                       fact_key    TEXT PRIMARY KEY,
+                       fact        TEXT NOT NULL,
+                       source      TEXT NOT NULL,
+                       confidence  REAL NOT NULL,
+                       evidence    TEXT DEFAULT '',
+                       added_at    REAL NOT NULL,
+                       accesses    INTEGER DEFAULT 0,
+                       last_access REAL DEFAULT 0.0)""")
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_prov_source ON fact_provenance(source)")
+            self._conn.commit()
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+    @staticmethod
+    def key(fact: str) -> str:
+        norm = _deaccent(re.sub(r'\s+', ' ', str(fact or '').lower()).strip())[:400]
+        return hashlib.sha1(norm.encode('utf-8')).hexdigest()[:20]
+
+    # ── escrita ───────────────────────────────────────────────────────────────
+    def record(self, fact: str, source: str = 'user', confidence: float = None,
+               evidence: str = '') -> bool:
+        """Registra a origem de um fato. False se já havia registro (idempotente)."""
+        if not fact or not str(fact).strip():
+            return False
+        conf = (SOURCE_CONFIDENCE.get(source, _UNKNOWN_SOURCE_CONF)
+                if confidence is None else float(confidence))
+        with self._lock:
+            cur = self._conn.execute(
+                """INSERT OR IGNORE INTO fact_provenance
+                   (fact_key, fact, source, confidence, evidence, added_at)
+                   VALUES (?,?,?,?,?,?)""",
+                (self.key(fact), str(fact)[:2000], source, conf, evidence[:500], time.time()))
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def bump(self, fact: str) -> bool:
+        """Conta um uso (recuperação) do fato."""
+        if not fact:
+            return False
+        with self._lock:
+            cur = self._conn.execute(
+                """UPDATE fact_provenance
+                   SET accesses = accesses + 1, last_access = ?
+                   WHERE fact_key = ?""", (time.time(), self.key(fact)))
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def backfill(self, facts: List[str], source: str = 'legacy',
+                 confidence: float = None) -> int:
+        """Marca fatos pré-existentes (sem registro) com uma origem padrão."""
+        return sum(1 for f in facts if self.record(f, source=source, confidence=confidence))
+
+    # ── leitura ───────────────────────────────────────────────────────────────
+    def get(self, fact: str) -> Optional[FactProvenance]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM fact_provenance WHERE fact_key = ?",
+                (self.key(fact),)).fetchone()
+        if row is None:
+            return None
+        return FactProvenance(fact=row['fact'], source=row['source'],
+                              confidence=row['confidence'], evidence=row['evidence'] or '',
+                              added_at=row['added_at'], accesses=row['accesses'],
+                              last_access=row['last_access'])
+
+    def all(self, source: str = None, min_confidence: float = 0.0,
+            limit: int = None) -> List[FactProvenance]:
+        sql = "SELECT * FROM fact_provenance WHERE confidence >= ?"
+        args: List[Any] = [min_confidence]
+        if source:
+            sql += " AND source = ?"
+            args.append(source)
+        sql += " ORDER BY added_at DESC"
+        if limit:
+            sql += " LIMIT ?"
+            args.append(int(limit))
+        with self._lock:
+            rows = self._conn.execute(sql, args).fetchall()
+        return [FactProvenance(fact=r['fact'], source=r['source'], confidence=r['confidence'],
+                               evidence=r['evidence'] or '', added_at=r['added_at'],
+                               accesses=r['accesses'], last_access=r['last_access'])
+                for r in rows]
+
+    def __len__(self) -> int:
+        with self._lock:
+            return int(self._conn.execute(
+                "SELECT COUNT(*) FROM fact_provenance").fetchone()[0])
+
+    def coverage(self, total_facts: int) -> float:
+        """Fração dos fatos conhecidos que têm origem registrada (0..1)."""
+        if not total_facts or total_facts <= 0:
+            return 0.0
+        return round(min(1.0, len(self) / float(total_facts)), 4)
+
+    def stats(self, total_facts: int = None) -> Dict[str, Any]:
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT source, COUNT(*) n, AVG(confidence) conf
+                   FROM fact_provenance GROUP BY source ORDER BY n DESC""").fetchall()
+            top = self._conn.execute(
+                """SELECT fact, source, accesses FROM fact_provenance
+                   WHERE accesses > 0 ORDER BY accesses DESC LIMIT 5""").fetchall()
+            avg = self._conn.execute(
+                "SELECT AVG(confidence) FROM fact_provenance").fetchone()[0]
+        out: Dict[str, Any] = {
+            'tracked': len(self),
+            'sources': {r['source']: {'facts': r['n'], 'avg_confidence': round(r['conf'], 3)}
+                        for r in rows},
+            'avg_confidence': round(avg, 3) if avg is not None else 0.0,
+            'top_accessed': [{'fact': r['fact'][:80], 'source': r['source'],
+                              'accesses': r['accesses']} for r in top],
+            'path': self.path,
+        }
+        if total_facts:
+            out['coverage'] = self.coverage(total_facts)
+        return out
+
+    def close(self) -> None:
+        with self._lock:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+
+
 class NexusV10:
     """
     Nexus v8 — Sistema Cognitivo Híbrido.
@@ -6823,6 +7056,11 @@ class NexusV10:
             conditional=self.conditional,
             episodic=self.episodes)
         self._tw = self.text_weaver
+
+        # ── Proveniência (origem/confiança de cada fato) ────────────────────────
+        # ':memory:' por padrão: instanciar um kernel não escreve em disco.
+        self.provenance = ProvenanceStore()
+        self._prov_path = ':memory:'
 
         # ── Seed de conhecimento ───────────────────────────────────────────────
         # CORRIGIDO: _seed_knowledge estava em código morto no V9 original.
@@ -7393,6 +7631,7 @@ class NexusV10:
             'sdr_prototypes': len(self.sdr_reasoner._prototypes),
             'pred_cache': self.pred_cache.stats,
             'bus_messages': len(self.rep_bus._messages),
+            'provenance': self.provenance.stats(total_facts=len(self.fact_store)),
         }
 
 
@@ -7635,9 +7874,20 @@ class NexusV10:
 
     @classmethod
     def load(cls, filepath: str, verbose: bool = False) -> 'NexusV8':
+        """Reconstrói o estado a partir do arquivo salvo por save().
+
+        IMPORTANTE: o método roda __init__ (via cls.__new__ + __init__ manual)
+        para garantir que TODOS os subsistemas existam. Antes, apenas os campos
+        presentes no arquivo eram recriados, deixando 18 atributos ausentes
+        (_dedup, _curiosita, xor_bind, sdr_reasoner, temporal, novelty, …) e
+        fazendo o primeiro chat() de uma instância carregada estourar
+        AttributeError. Os dados do arquivo então SOBRESCREVEM o estado novo.
+        """
         with open(filepath, 'r', encoding='utf-8') as f:
             data = json.load(f)
         n = cls.__new__(cls)
+        cls.__init__(n, verbose=verbose)      # todos os módulos + seeds
+        n._autosave_enabled = False           # load() nunca salva por conta própria
         n._verbose      = verbose
         n.encoder       = MultiLobeEncoder.from_dict(data.get('encoder', {}))
         n.embed         = MiniEmbed.from_dict(data.get('embed', {}))
@@ -7671,6 +7921,13 @@ class NexusV10:
         else:
             n.sp_encoder  = None
             n._sp_trained = False
+        # ContextEngine (gravado por save(); sem restaurar, chat() quebrava com
+        # AttributeError em _resolve_pronouns logo no primeiro turno).
+        ctx_vec = data.get('ctx_topic_vec') or []
+        n._ctx_topic_vec = ([float(x) for x in ctx_vec] if len(ctx_vec) == n.embed.DIM
+                            else [0.0] * n.embed.DIM)
+        n._ctx_entities = list(data.get('ctx_entities') or [])[:20]
+        n._ctx_turn     = int(data.get('ctx_turn') or 0)
         # Restaurar pending_confirm: reconstrói SDR do novo fato se necessário
         pc = data.get('pending_confirm')
         if pc and pc.get('new_text'):
@@ -7683,6 +7940,28 @@ class NexusV10:
             n._pending_confirm = None
         n._dialog_ctx = []  # não persistido — janela de diálogo reinicia a cada sessão
         n._facts_since_sleep = 0
+        # Reconstrói o índice de deduplicação SDR (não é serializado): sem isto,
+        # um kernel carregado aceitaria "reaprender" fatos já existentes e
+        # responderia "Aprendi" para algo que não foi armazenado.
+        try:
+            for _f in n.fact_store.all_facts()[:5000]:
+                n._dedup.record(_f)
+        except Exception:
+            pass
+        # ── Re-vinculação: módulos criados no __init__ guardavam referências ao
+        #    encoder/embed/ngram ANTIGOS; após a restauração eles precisam
+        #    apontar para os objetos vindos do arquivo.
+        n._dedup        = DeduplicatorSDR(n.encoder)
+        n.xor_bind      = XORBinding(n.encoder)
+        n.beam_gen      = BeamGenerator(n.ngram, n.embed)
+        n.attn_pool     = AttentionPool(n.embed)
+        n.text_weaver   = TextWeaver(
+            embed=n.embed, concept_graph=n.concept_graph, fact_store=n.fact_store,
+            ngram=n.ngram, deductive=n.deductive, conditional=n.conditional,
+            episodic=n.episodes)
+        n._tw = n.text_weaver
+        n.deductive._embed       = n.embed
+        n.deductive._conditional = n.conditional
         def _auto_promote(belief: Belief, brain: CognitiveBrain) -> None:
             brain.store(belief.sdr, belief.text, tag='FACT',
                         confidence=belief.confidence)
@@ -7874,6 +8153,136 @@ class NexusV10:
         q_stems = {w[:6] for w in q}
         f_stems = {w[:6] for w in f}
         return len(q_stems & f_stems) >= min_shared
+
+    # ── Fusão léxico-semântica: gate lexical + ranking por embedding ─────────
+    # O GATE continua lexical (precisão: nunca deixar passar fato alheio). O
+    # embedding entra em DUAS funções onde ele não pode causar alucinação:
+    #   (a) ordenar candidatos que JÁ passaram pelo gate;
+    #   (b) medir cobertura da consulta, para a resposta honesta dizer o que
+    #       falta ("sei algo relacionado, mas não a definição").
+    _EMBED_WEIGHT = 0.35
+
+    def _embed_cosine(self, a: str, b: str) -> float:
+        """Similaridade de cosseno entre duas frases (0..1). 0 se indisponível."""
+        try:
+            if not getattr(self.embed, '_vocab', None):
+                return 0.0
+            va, vb = self.embed.sentence_vector(a), self.embed.sentence_vector(b)
+            if not va or not vb:
+                return 0.0
+            num = sum(x * y for x, y in zip(va, vb))
+            na = math.sqrt(sum(x * x for x in va)) or 1.0
+            nb = math.sqrt(sum(y * y for y in vb)) or 1.0
+            return max(0.0, min(1.0, num / (na * nb)))
+        except Exception:
+            return 0.0
+
+    def _relevance_score(self, query: str, fact: str) -> float:
+        """
+        Score 0..1 de relevância de um fato para a consulta.
+
+        lexical = fração dos radicais (6 chars) da consulta presentes no fato;
+        semântico = cosseno MiniEmbed entre as frases.
+        Pesos: 0.65 lexical + 0.35 semântico — o lexical domina de propósito:
+        é ele que sustenta a garantia epistêmica do sistema.
+        """
+        q = self._content_tokens(query)
+        f = self._content_tokens(fact)
+        if not q or not f:
+            return 0.0
+        qs = {w[:6] for w in q}
+        fs = {w[:6] for w in f}
+        lexical = len(qs & fs) / max(len(qs), 1)
+        sem = self._embed_cosine(query, fact)
+        return round((1 - self._EMBED_WEIGHT) * lexical + self._EMBED_WEIGHT * sem, 4)
+
+    def estimate_coverage(self, query: str, max_facts: int = 800) -> Dict[str, Any]:
+        """
+        Quanta informação o sistema TEM sobre a consulta?
+
+        Diferente de responder (que devolve o melhor fato), isto quantifica:
+          • score do melhor fato (0..1)
+          • termos da consulta que NÃO aparecem em nenhum fato (lacunas)
+          • conceitos relacionados existentes no grafo
+        Serve para a UI/agente decidir entre responder, pedir para ensinar ou
+        avisar que sabe apenas parte do assunto.
+        """
+        q_toks = self._content_tokens(query)
+        q_stems = {w[:6] for w in q_toks}
+        if not q_stems:
+            return {'known': False, 'score': 0.0, 'best_fact': '', 'missing': [],
+                    'related': [], 'reason': 'consulta sem termos de conteúdo'}
+        try:
+            fatos = self.fact_store.all_facts()[:max_facts]
+        except Exception:
+            fatos = []
+        cobertos: Set[str] = set()
+        best_score, best_fact = 0.0, ''
+        for fato in fatos:
+            f_stems = {w[:6] for w in self._content_tokens(fato)}
+            inter = q_stems & f_stems
+            if not inter:
+                continue
+            cobertos |= inter
+            sc = self._relevance_score(query, fato)
+            if sc > best_score:
+                best_score, best_fact = sc, fato
+        missing = sorted(q_stems - cobertos)
+        # Conceitos relacionados: apenas nós que JÁ existiam no grafo com pelo
+        # menos uma aresta real (o grafo registra a própria consulta como nó —
+        # isso é eco, não conhecimento).
+        related: List[str] = []
+        try:
+            for stem in q_stems:
+                for no in self.concept_graph._edges:
+                    if _deaccent(no)[:6] == stem and self.concept_graph._edges[no]:
+                        if no not in related:
+                            related.append(no)
+        except Exception:
+            related = []
+        return {
+            'known': bool(best_fact) and self._fact_is_relevant(query, best_fact),
+            'score': best_score,
+            'best_fact': best_fact,
+            'missing': missing,
+            'related': related[:5],
+            'coverage': round(len(cobertos) / max(len(q_stems), 1), 3),
+        }
+
+    def _partial_knowledge_answer(self, text: str, topic: str = '') -> Optional[str]:
+        """
+        Resposta honesta de conhecimento PARCIAL.
+
+        Quando não há fato que responda, mas o CONCEITO perguntado existe no
+        grafo com relações reais ("ribossomo sintetiza proteínas"), devolver
+        isso é mais útil do que um "não sei" seco — e continua honesto: deixa
+        explícito que falta a definição.
+        """
+        try:
+            cov = self.estimate_coverage(text)
+        except Exception:
+            return None
+        if cov.get('related'):
+            partes = []
+            for c in cov['related'][:2]:
+                rels = self._relations_of(c)
+                partes.append(f'"{c}"' + (f' ({"; ".join(rels)})' if rels else ''))
+            conhecidos = ', '.join(partes)
+            return (f'Conheço o conceito {conhecidos}, mas não tenho uma definição '
+                    f'para ele. Me ensine: "aprenda: {topic or text[:25]} é ..."')
+        return None
+
+    def _relations_of(self, concept: str, limit: int = 2) -> List[str]:
+        """Relações conhecidas de um conceito no grafo ('produz energia', …)."""
+        out: List[str] = []
+        try:
+            rels = self.concept_graph._edges.get(concept.lower(), {})
+            for obj, rel_map in list(rels.items())[:limit]:
+                rel = next(iter(rel_map), 'relaciona-se com')
+                out.append(f'{rel} {obj}')
+        except Exception:
+            pass
+        return out
 
     def _route(self, text: str, sdr: SparseSDR) -> str:
         tl = text.lower().strip()
@@ -8907,6 +9316,7 @@ class NexusV10:
                         if shared >= 2:
                             extra = h2
                         break
+                    self.provenance.bump(best)
                     return self.mouth.speak_fact(best, extra)
 
         # V10: XOR unbinding — busca relações no espaço SDR
@@ -9001,6 +9411,12 @@ class NexusV10:
                 top3 = [c for c, _ in top_concepts
                         if _deaccent(c.lower())[:6] not in q_stems][:3]
                 if top3:
+                    # Se o próprio conceito perguntado é conhecido (tem
+                    # relações no grafo), a resposta parcial é mais informativa
+                    # do que listar vizinhos.
+                    parcial = self._partial_knowledge_answer(text, subj or '')
+                    if parcial:
+                        return parcial
                     related = ', '.join(top3)
                     return f'Conceitos relacionados: {related}'
 
@@ -9053,6 +9469,14 @@ class NexusV10:
                 edge.weaken(penalty=0.05)  # penalidade leve e gradual
         self.homeostasis.on_failed_infer()
         topic = subj or (words_fb[0] if words_fb else text[:30])
+
+        # Antes de admitir ignorância total: existe conhecimento PARCIAL sobre o
+        # tema (fatos que compartilham radical com a consulta, mas não a
+        # respondem) ou conceitos relacionados? Se sim, dizemos o que sabemos e
+        # o que falta — mais útil que um silêncio, e igualmente honesto.
+        parcial = self._partial_knowledge_answer(text, topic)
+        if parcial:
+            return parcial
         return self.mouth.speak_unknown(topic)
 
     # ── Auto-persistência ────────────────────────────────────────────────────
@@ -9218,6 +9642,7 @@ class NexusV10:
             self.fact_store.add(s)
             self.embed.learn(s)
             self._learn_edge(s)
+            self.provenance.record(s, source='seed')
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -9236,6 +9661,38 @@ class NexusV10:
         if path:
             self._persist_path = path
 
+    def set_provenance_path(self, path: str) -> None:
+        """Persiste a proveniência em disco (ex.: 'nexus_provenance.db').
+
+        Migra os registros já existentes (seeds, fatos aprendidos antes da
+        troca) para o novo armazenamento — sem isso a cobertura zeraria.
+        """
+        if path and path != self._prov_path:
+            antigo = self.provenance
+            novo = ProvenanceStore(path)
+            for p in antigo.all(limit=None):
+                novo.record(p.fact, source=p.source, confidence=p.confidence,
+                            evidence=p.evidence)
+            antigo.close()
+            self.provenance = novo
+            self._prov_path = path
+
+    def explain(self, fact: str) -> Dict[str, Any]:
+        """De onde veio este fato? (origem, confiança, evidência, uso)"""
+        p = self.provenance.get(fact)
+        if p is None:
+            # Tenta casar por prefixo (o usuário raramente digita o fato inteiro)
+            stem = _deaccent(fact.lower())[:40]
+            for cand in self.provenance.all(limit=500):
+                if stem and stem in _deaccent(cand.fact.lower()):
+                    p = cand
+                    break
+        if p is None:
+            return {'known': False, 'fact': fact,
+                    'hint': 'sem registro de origem (fato pode ter sido aprendido antes da '
+                            'proveniência existir — use provenance.backfill())'}
+        return {'known': True, **p.to_dict()}
+
     def reset_context(self) -> None:
         """Limpa o contexto de diálogo.
         Útil quando o sistema entra em loop de repetição.
@@ -9250,7 +9707,8 @@ class NexusV10:
             self._pending_confirm = None
 
     def learn_document(self, text: str, max_fact_len: int = 250,
-                        min_fact_len: int = 20) -> int:
+                        min_fact_len: int = 20, source: str = 'document',
+                        evidence: str = '') -> int:
         """Segmenta um documento longo em fatos atômicos e aprende cada um.
         FIX do V12: no V9 original, textos longos eram injetados como 1 único fato.
         Retorna o número de fatos aprendidos com sucesso.
@@ -9266,6 +9724,8 @@ class NexusV10:
                     result = self.chat(f'aprenda: {sent_clean}')
                     if 'Aprendi' in result or '[dedup]' not in result.lower():
                         learned += 1
+                        self.provenance.record(sent_clean, source=source,
+                                               evidence=evidence)
         return learned
 
     def wiki_expand(self, topic: str, max_sentences: int = 6) -> str:
@@ -9298,6 +9758,7 @@ class NexusV10:
                     result = self.chat(f'aprenda: {s}')
                     if 'Aprendi' in result:
                         learned += 1
+                        self.provenance.record(s, source='wikipedia', evidence=url)
             return f"[wiki] '{topic}': {learned} fatos aprendidos de {min(len(sentences), max_sentences)} sentenças"
         except Exception as e:
             return f"[wiki] Erro ao buscar '{topic}': {type(e).__name__}: {e}"
@@ -9338,6 +9799,8 @@ class NexusV10:
                 f"  SDR Protótipos  : {len(self.sdr_reasoner._prototypes)}\n"
                 f"  Cache hits      : {self.pred_cache.stats}\n"
                 f"  Bus mensagens   : {len(self.rep_bus._messages)}\n"
+                f"  Proveniência    : {self.provenance.stats(total_facts=len(self.fact_store)).get('tracked', 0)} fatos rastreados "
+                f"({self.provenance.coverage(len(self.fact_store)):.0%} de cobertura)\n"
             )
         except Exception as e:
             return f"[scan_health] Erro: {e}"
@@ -9357,9 +9820,13 @@ class NexusV10:
         """Alias de deep_scan — compatibilidade com versões anteriores."""
         return self.deep_scan(corpus)
 
-    def learn(self, fact: str, timestamp: float = None) -> str:
+    def learn(self, fact: str, timestamp: float = None, source: str = 'user',
+              confidence: float = None, evidence: str = '') -> str:
         """API V12: aprende um fato com deduplicação SDR e verificação de consistência.
         Wrapper de alto nível sobre o chat('aprenda: ...').
+
+        `source`/`confidence`/`evidence` alimentam o ProvenanceStore (de onde
+        veio o fato). Um fato bloqueado por dedup NÃO ganha novo registro.
         """
         # Verificação de duplicata
         dup = self._dedup.is_duplicate(fact)
@@ -9372,10 +9839,20 @@ class NexusV10:
             # Aprende mesmo assim mas marca — nunca silencia informação
             result = self.chat(f'aprenda: {fact}')
             return f"{result}\n{issue}"
+        _antes = len(self.fact_store)
         result = self.chat(f'aprenda: {fact}')
+        _cresceu = len(self.fact_store) > _antes
+        if 'Aprendi' in result and not _cresceu:
+            # Dedup interno do FactStore bloqueou o fato: reportar "Aprendi"
+            # seria mentira (o conhecimento não foi armazenado).
+            self._v12_stats['blocked'] = self._v12_stats.get('blocked', 0) + 1
+            self._dedup.record(fact)
+            return f"[dedup] Fato já conhecido: '{str(fact)[:60]}'"
         if 'Aprendi' in result:
             self._dedup.record(fact)
             self._v12_stats['learned'] = self._v12_stats.get('learned', 0) + 1
+            self.provenance.record(fact, source=source, confidence=confidence,
+                                   evidence=evidence)
         
         # V10: XOR binding — codifica relação no espaço SDR
         rel_match = re.match(r'^([\w\s]{2,25})\s+(?:é|são|tem|possui|produz|causa)\s+(.+)$', fact.lower().strip() if isinstance(fact, str) else '')
@@ -9849,13 +10326,17 @@ class GlobalWorkspaceNexus:
 
     # ── API principal ─────────────────────────────────────────────────────────
 
-    def learn(self, fact: str, timestamp: float = None) -> str:
+    def learn(self, fact: str, timestamp: float = None, source: str = 'user',
+              confidence: float = None, evidence: str = '') -> str:
         """
         Aprende um fato no núcleo NexusFinal E nos brains especializados.
         Inclui deduplicação SDR, verificação de consistência e propagação cross-domain.
+
+        `source`/`confidence`/`evidence` são repassados ao ProvenanceStore.
         """
         # Aprende no núcleo
-        result = self._core.learn(fact, timestamp=timestamp)
+        result = self._core.learn(fact, timestamp=timestamp, source=source,
+                                  confidence=confidence, evidence=evidence)
 
         # Armazena na SharedMemory (Hipocampo Compartilhado)
         if hasattr(self, "_shared_memory") and self._shared_memory is not None:
@@ -9874,7 +10355,8 @@ class GlobalWorkspaceNexus:
         return result
 
     def learn_document(self, text: str, max_fact_len: int = 250,
-                        min_fact_len: int = 20) -> int:
+                        min_fact_len: int = 20, source: str = 'document',
+                        evidence: str = '') -> int:
         """Segmenta documento em fatos atômicos e aprende cada um."""
         sentences = re.split(r'(?<=[.!?])\s+', text)
         learned = 0
@@ -9883,7 +10365,7 @@ class GlobalWorkspaceNexus:
             if min_fact_len <= len(sent) <= max_fact_len:
                 sent_clean = re.sub(r'[*#`>|]', '', sent).strip()
                 if len(sent_clean) >= min_fact_len:
-                    result = self.learn(sent_clean)
+                    result = self.learn(sent_clean, source=source, evidence=evidence)
                     if '[dedup]' not in result.lower():
                         learned += 1
         return learned
@@ -10014,6 +10496,36 @@ class GlobalWorkspaceNexus:
 
     def status(self) -> Dict:
         return self._core.status()
+
+    def explain(self, fact: str) -> Dict[str, Any]:
+        return self._core.explain(fact)
+
+    def _refresh_core_references(self) -> None:
+        """Re-vincula módulos do workspace ao núcleo atual (após load_state)."""
+        enc = self._core.encoder
+        for brain in self._brains.values():
+            brain._enc = enc
+        self._stats.setdefault('specialist_contributions', 0)
+
+    def reattribute_facts(self, max_facts: int = 2000) -> int:
+        """Re-atribui fatos do núcleo aos cérebros (usado depois de load_state)."""
+        try:
+            fatos = self._core.fact_store.all_facts()
+        except Exception:
+            return 0
+        atribuidos = 0
+        for fato in fatos[:max_facts]:
+            if self._shared_memory.store(fato, brain_origin="core"):
+                self._propagate_to_specialists(fato)
+                atribuidos += 1
+        return atribuidos
+
+    def set_provenance_path(self, path: str) -> None:
+        self._core.set_provenance_path(path)
+
+    @property
+    def provenance(self) -> 'ProvenanceStore':
+        return self._core.provenance
 
     def deep_scan(self, corpus: str) -> str:
         return self._core.deep_scan(corpus)
@@ -12053,9 +12565,19 @@ class NexusPersistV11:
         Retorna relatório de integridade.
         """
         if not _AIOSQLITE_OK:
-            return {"status": "simulated", "corrupt": 0, "ok": 0}
+            # Modo simulado (sem aiosqlite): mantém o MESMO schema do caminho
+            # real — quem consome o relatório não deve precisar de dois parsers.
+            return {
+                "status": "simulated",
+                "db_secure": {"ok": 0, "corrupt": 0, "simulated": True},
+                "db_iot":    {"ok": 0, "corrupt": 0, "simulated": True},
+                "ts": time.time(),
+                "summary": {"total": 0, "ok": 0, "corrupt": 0,
+                            "integrity_pct": 100.0, "simulated": True},
+            }
 
-        report = {"db_secure": {"ok": 0, "corrupt": 0},
+        report = {"status": "scanned",
+                  "db_secure": {"ok": 0, "corrupt": 0},
                   "db_iot":    {"ok": 0, "corrupt": 0},
                   "ts": time.time()}
 
@@ -12929,6 +13451,12 @@ class NexusV14Unified:
     def __init__(self, verbose: bool = False, production: bool = False):
         # ── Núcleo cognitivo (V10) ───────────────────────────────
         self.cognitive = GlobalWorkspaceNexus(autosave=False)
+        # Proveniência persistente por padrão no kernel unificado (arquivo
+        # ignorado pelo git; trocável via set_provenance_path / cognitive).
+        try:
+            self.cognitive.set_provenance_path('nexus_provenance.db')
+        except Exception:
+            pass
         
         # ── Camada de produção (V11.2) ───────────────────────────
         self.guard      = NexusGuardV11()
@@ -12998,9 +13526,57 @@ class NexusV14Unified:
         """Interface conversacional principal (V10 GlobalWorkspace)."""
         return self.cognitive.chat(text)
     
-    def learn(self, fact: str, domain: str = "general") -> str:
-        """Aprende um fato (V10 + propagação cross-domain)."""
-        return self.cognitive.learn(fact)
+    def learn(self, fact: str, domain: str = "general", source: str = 'user',
+              confidence: float = None, evidence: str = '') -> str:
+        """Aprende um fato (V10 + propagação cross-domain) e registra a origem."""
+        return self.cognitive.learn(fact, source=source, confidence=confidence,
+                                    evidence=evidence)
+
+    def explain(self, fact: str) -> Dict[str, Any]:
+        """Origem/confiança/evidência de um fato aprendido."""
+        return self.cognitive.explain(fact)
+
+    def provenance_report(self) -> Dict[str, Any]:
+        """Resumo de proveniência do conhecimento acumulado."""
+        return self.cognitive.provenance.stats(total_facts=self.status().get('facts', 0))
+
+    # ── Estado persistente (JSON) ─────────────────────────────────────────────
+
+    def save_state(self, path: Optional[str] = None) -> bool:
+        """Salva o estado cognitivo completo (formato compacto, ~5 MB/300 tokens)."""
+        try:
+            return bool(self.cognitive._core.save(path or 'nexus_state.json'))
+        except Exception as e:
+            print(f'[save_state] {e}')
+            return False
+
+    def load_state(self, path: str = 'nexus_state.json', reattribute: bool = True,
+                   max_reattribute: int = 2000) -> bool:
+        """
+        Carrega um estado salvo por save_state() e o injeta no workspace.
+
+        Além de trocar o núcleo, re-atribui os fatos aos cérebros especializados
+        no hipocampo compartilhado (senão os cérebros nasceriam vazios e a
+        consulta por domínio não acharia nada). `max_reattribute` limita o custo
+        em bases muito grandes.
+        """
+        if not os.path.exists(path):
+            return False
+        try:
+            prov_path = getattr(self.cognitive._core, '_prov_path', ':memory:')
+            core = NexusV10.load(path)
+            self.cognitive._core = core
+            # O núcleo carregado nasce com um store em memória: reaplica o
+            # caminho de proveniência configurado (migrando os seeds do load).
+            if prov_path and prov_path != ':memory:':
+                core.set_provenance_path(prov_path)
+            self.cognitive._refresh_core_references()
+            if reattribute:
+                self.cognitive.reattribute_facts(max_facts=max_reattribute)
+            return True
+        except Exception as e:
+            print(f'[load_state] {e}')
+            return False
     
     def status(self) -> Dict:
         """Status estruturado do núcleo cognitivo (delegação ao GlobalWorkspace)."""

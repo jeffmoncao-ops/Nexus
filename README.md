@@ -1,83 +1,113 @@
-# Nexus V14 Unified: Neuro-Symbolic AGI Kernel
+# Nexus V14 Unified: Neuro-Symbolic Cognitive Kernel
 
 **Codename “Chronos” · runtime version `v14-unified`.**
 
-Nexus V14 Unified is a high-performance cognitive operating system kernel designed for edge computing, robotics, and advanced neural interfaces. Unlike traditional Large Language Models (LLMs) that rely on probabilistic token prediction, Nexus operates as a Neuro-Symbolic Kernel, utilizing Sparse Distributed Representations (SDR) and Hyperdimensional Computing (HDC) to achieve human-like reasoning with a fraction of the hardware requirements.
+Nexus is a self-contained neuro-symbolic kernel written in pure Python: it stores
+knowledge as text + 4096-bit Sparse Distributed Representations (SDR), reasons
+over it with XOR bindings, graph propagation and rule engines, and — most
+importantly — **admits when it does not know something** instead of inventing an
+answer.
 
-## 🌌 Core Philosophy: The Redemptive Thread
+It is not a large language model, and it is not an AGI. It is a small, auditable,
+dependency-free cognitive core: no GPU, no transformer, no cloud, no training.
 
-Nexus is built on the principle of Biological Mimicry. It processes information not as strings of text, but as geometric signatures in a 4096-dimensional space. This allows for:
+> **Read this first:** the matrix below separates *what the code actually does
+> today* from *what is a demonstration* and from *what is a research direction*.
+> Earlier revisions of this README described all three as if they were the same
+> thing. They are not.
 
-* **Zero-Shot Learning:** Immediate integration of new facts without retraining (`aprenda: <fato>`).
-* **Epistemic Validation:** A sandbox-driven "promotion" system where hypotheses only become "facts" after logical or functional verification — and where the kernel answers *"ainda não está na minha base. Me ensine."* instead of inventing something when it does not know. Retrieval is gated by content overlap with the question, so an unknown topic never returns an unrelated fact.
-* **Energy Efficiency:** A million-fact memory runs on local hardware with minimal RAM overhead — no GPU, no transformer, no cloud.
+## 🧭 Capability matrix
 
-## 🛠 Technical Architecture
+**✅ Works — implemented, covered by tests, verified in CI**
 
-### 1. Hippocampus (Memory)
+| Capability | Evidence |
+| --- | --- |
+| Learned facts with recall by definitional queries (`o que é X?`) | `--test` 34/34, `pytest tests` (112 tests) |
+| Epistemic honesty: unknown topics are refused, never answered with an unrelated fact | gate tests + regression suite (quasar, entropia, napoleão, buraco negro) |
+| SDR algebra (union/intersection/XOR/Jaccard), semantic LSH encoder | `TestPrimitivasSDR` |
+| Multi-brain: 8 domains + custom, N:N fact attribution in a shared hippocampus | `TestMultiCerebros`, `TestMemorySchema` |
+| Deterministic persistence: JSON state + SQLite provenance, `save_state`/`load_state` | `TestPersistencia`, save ≈5.3 MB |
+| Provenance: origin, confidence, evidence and usage count per fact | `TestProveniencia`, `/api/provenance` |
+| Corpus ingestion: files, directories, JSONL, Wikipedia, with real dedup | `TestIngestao`, `nexus_ingest.py` |
+| Async production layer: HMAC integrity, SDR packet filter, healer, gateway, domain bus | `TestPersistenciaEHealer`, V11.2 tests |
+| Runs with **zero** optional dependencies (pure-Python fallbacks) | CI job `kernel-sem-deps` on Python 3.9/3.11/3.12 |
+| HTTP API + dashboard (chat, hippocampus, brains, IoT, sensory, code, knowledge) | `TestApiCompleta`, CI smoke test |
+| Code generation from ~30 CBR templates executed in an AST sandbox | `TestProducaoERegressao` |
 
-Layered persistence for high-recall, high-precision memory:
+**🧪 Demonstration — runs end-to-end, but is not what the name suggests**
 
-* **L1 Cache (Intuition):** SQLite + **FTS5** lexical index for cheap, immediate recall of learned facts.
-* **L2 Deep Store (Cognition):** full **4096-bit SDR BLOBs** (80 active bits ≈ 2% sparsity) for Jaccard similarity, XOR-based analogical reasoning, and an LSH-based semantic encoder (`locality-sensitive hashing`, no training required).
-* **Shared Hippocampus (Multi-Brain):** `shared_facts` + `shared_fact_brains` tables give facts an **N:N attribution** to specialized cortices — an interdisciplinary fact (“algoritmo genético”) can belong to Tecnologia *and* Biologia at the same time.
+| Feature | Honest description |
+| --- | --- |
+| `NexusGuardV11` “encryption” | Deterministic XOR-stream **obfuscation**, not cryptography: fixed keystream, key derived from an in-source seed, no nonce, no authenticated encryption. Same plaintext → same ciphertext. Also tracked: a non-collision-resistant MAC construction (`sha256(payload)[:8]`-style truncation), which bounds forgery resistance to ~2³² guesses. Do not protect real secrets with it. |
+| “Zero-shot learning” | Storing a sentence and retrieving it later. There is no generalisation across synonyms: teach “carro” and “automóvel” still returns “not in my knowledge base”. |
+| “Reasoning” | Rule engines (conditional, deductive, transitive) and graph propagation over a *small* hand-fed base. They work; they do not discover rules from data at scale. |
+| Sensory encoders (V13) | Deterministic RGB→40-bit and PCM→40-bit projections. They are feature hashes, not perception. |
+| Code generation | Case-based retrieval from templates + repair loop in a sandbox. Ask for something outside the templates and it says so. |
+| IoT pipeline | A well-built telemetry path (filter → domain bus → persistence) exercised by synthetic packets, not a deployed fleet. |
 
-### 2. HDCRoles (Algebraic Reasoning)
+**🔭 Vision — stated as ambition, not as delivered functionality**
 
-XOR Binding + Cyclic Permutation encode structural relationships. Subject, Relation, and Object are separated by rotating bit-vectors, which prevents the "semantic soup" effect of simpler vector databases. Unbinding is *verified* against the stored subject before it is spoken, so a query about an unknown subject cannot return another subject’s definition.
+* Autonomous drones, robotics and neural prosthetics using this kernel.
+* “Million-fact memory”: the architecture allows it; nobody has measured it.
+* Associative, human-like recall at LLM quality without transformers.
+* Global-workspace consciousness metaphors: useful as design vocabulary, not as
+  an empirical claim about the software.
 
-### 3. MultiBrain & Global Workspace
+## 🛠 Architecture
 
-A "Thalamus-Cortex" model:
-
-* **Specialized Cortices:** eight default domains (Biologia, Física, Matemática, Tecnologia, História, Medicina, Geografia, Linguística) plus `add_brain()` / `remove_brain()` for custom domains.
-* **Global Workspace:** a central hub that manages lateral inhibition, consultation, sleep consolidation and cross-domain propagation — the most relevant cortex takes control of the output.
-
-### 4. Production Layer (V11.2)
-
-Mission-critical path used by the IoT/telemetry pipeline:
-
-* **NexusGuardV11:** XOR-stream cipher + HMAC-SHA256 signatures, deterministic SHA-256 key derivation.
-* **NexusSDRFilter:** Lateral Inhibition gate — validates sparsity (0.5 %–8 %), distribution and mask signature, blocking truncated/anomalous packets (`sensor=“x”` → `REJECTED`).
-* **NexusPersistV11 / NexusHealerV11 / NexusSeniorGateway:** async SQLite persistence, integrity scans, self-healing of queues/stores, rate limiting (429) and payload limits (413). All async paths run with `aiosqlite` when installed and fall back to simulation otherwise.
-* **NexusDomainBus:** concurrent multi-domain packet processing (biologia / financas / fisica_tcu).
-
-### 5. Sensory Encoders (V13)
-
-Deterministic image (RGB → 40 active bits) and audio (PCM → spectral SDR) encoders, with safe handling of empty/malformed input.
+* **Memory** — SQLite + FTS5 lexical index (fast recall) **plus** 4096-bit SDR
+  blobs (80 active bits ≈ 2 % sparsity) for similarity, XOR unbinding and
+  analogical reasoning. An LSH semantic encoder needs no training.
+* **Shared hippocampus** — `shared_facts` + `shared_fact_brains` give every fact
+  an N:N attribution to specialised cortices: an interdisciplinary fact
+  (“algoritmo genético”) belongs to Tecnologia *and* Biologia.
+* **Epistemic gate (anti-hallucination)** — before any candidate fact is spoken,
+  it must share content roots with the question. Vector search always returns a
+  nearest neighbour; the gate is what turns “nearest neighbour of an unknown
+  topic” into an honest *“ainda não está na minha base. Me ensine.”*
+* **Verified XOR unbinding** — `unbind_object_verified()` returns the *stored*
+  subject alongside the object, so a query about an unknown subject can never
+  borrow another subject’s definition.
+* **Partial knowledge** — when a concept is known through relations but has no
+  definition, the kernel says what it knows and asks to be taught the rest
+  (`estimate_coverage()` quantifies this per query).
+* **Provenance** — every learned fact carries source, confidence, evidence and
+  usage counters; `explain('mitocôndria')` answers *“where did you get this?”*.
+* **Ingestion** — `nexus_ingest.py` feeds the kernel from files, directories,
+  JSONL or Wikipedia, counting new facts vs. real duplicates.
+* **Production layer (V11.2)** — HMAC integrity checks, lateral-inhibition packet
+  filter, healer, rate-limited gateway, concurrent domain bus. All async paths
+  have pure-Python fallbacks.
 
 ## 📥 Installation
 
-The kernel runs on **Python 3.9+ with no mandatory third-party dependency** — every optional subsystem has a pure-Python fallback. Install the extras to enable the fast paths:
+The kernel runs on **Python 3.9+ with no mandatory third-party dependency**.
+Extras enable faster paths:
 
 ```bash
 pip install -r requirements.txt          # numpy (vector speed) + aiosqlite (real async persistence)
 pip install -r requirements-server.txt   # fastapi + uvicorn → HTTP API + dashboard
 pip install -r requirements-dev.txt      # pytest + httpx → test suite
-```
-
-> In environments with an externally managed Python you may need `pip install --break-system-packages -r …` or a virtualenv.
-
-Check what is available at any moment:
-
-```bash
 python3 nexus_v14_shared_hippocampus.py --selfcheck
-# nexus v14-unified | numpy=sim | aiosqlite=sim | fastapi=sim
+# nexus v14-unified | numpy=não | aiosqlite=não | fastapi=não   ← also valid: pure Python
 ```
 
-## 🚀 Quick Start
+On externally-managed Python you may need `--break-system-packages` or a venv.
 
-### Command line
+## 🚀 Usage
+
+### CLI
 
 ```bash
 python3 nexus_v14_shared_hippocampus.py            # interactive chat
-python3 nexus_v14_shared_hippocampus.py --demo     # full demo: cognitive + IoT + crypto + sensory
+python3 nexus_v14_shared_hippocampus.py --demo     # cognitive + IoT + crypto + sensory demo
 python3 nexus_v14_shared_hippocampus.py --production  # V11.2 mission-critical kernel demo
-python3 nexus_v14_shared_hippocampus.py --gw       # chat with the Global Workspace (multi-brain)
-python3 nexus_v14_shared_hippocampus.py --test     # integrated suite (V14 selftest + V10 + basics)
+python3 nexus_v14_shared_hippocampus.py --gw       # chat with the Global Workspace
+python3 nexus_v14_shared_hippocampus.py --test     # selftest + 34 integrated tests + basics
 python3 nexus_v14_shared_hippocampus.py --v10-test # fast V10 core tests
-python3 nexus_v14_shared_hippocampus.py --health   # system health report
-python3 nexus_v14_shared_hippocampus.py --serve 8000  # HTTP REST API + dashboard
+python3 nexus_v14_shared_hippocampus.py --health   # health report (incl. provenance coverage)
+python3 nexus_v14_shared_hippocampus.py --serve 8000  # HTTP API + dashboard
+python3 nexus_v14_shared_hippocampus.py --selfcheck   # which optional deps are available
 ```
 
 ### Python API
@@ -87,71 +117,113 @@ from nexus_core import NexusV14Unified
 
 nexus = NexusV14Unified()
 print(nexus.chat("aprenda: a lei de Ohm estabelece que V = I × R"))
-print(nexus.chat("o que é a lei de ohm?"))
-print(nexus.chat("calcule 12 * (3 + 4)"))          # = 84
-print(nexus.chat("o que é entropia?"))             # honest: not in the knowledge base yet
+print(nexus.chat("o que é a lei de ohm?"))     # answers
+print(nexus.chat("o que é entropia?"))         # honest: not in the knowledge base yet
+print(nexus.explain("lei de ohm"))             # {'source': 'user', 'confidence': 0.95, ...}
 print(nexus.scan_health())
 ```
 
-Production layer (async):
+### Feeding it real knowledge
 
-```python
-import asyncio
-from nexus_core import NexusV14Unified
-
-async def main():
-    nexus = NexusV14Unified(production=True)       # boots Guard, Filter, Persist, Gateway, DomainBus
-    result = await nexus.process_iot(
-        "biologia", "sensor_01", "sequência genômica ATCG com 98.7% de match")
-    print(result)                                   # status: ACCEPTED, 80 SDR bits
-
-asyncio.run(main())
+```bash
+python3 nexus_ingest.py --file manual.md --dir docs/ --wiki Fotossíntese \
+                        --confidence 0.9 --report ingest.json
 ```
 
-### HTTP API + Dashboard
+```python
+import nexus_ingest
+from nexus_core import NexusV14Unified
+
+kernel = NexusV14Unified()
+kernel.load_state("nexus_state.json")                       # accumulate across runs
+print(nexus_ingest.ingest_text(kernel, open("aula.md").read(),
+                               source="ingest", evidence="aula.md"))
+kernel.save_state("nexus_state.json")
+```
+
+Re-ingesting the same corpus reports `0 new / N duplicates` — dedup is measured
+against the real fact store, not against a message string.
+
+### HTTP API + dashboard
 
 ```bash
 python3 nexus_v14_shared_hippocampus.py --serve 8000   # or: python3 nexus_server.py 8000
-# dashboard → http://localhost:8000   (single-page UI, no external assets)
 ```
 
 | Method | Route | Purpose |
 | --- | --- | --- |
-| GET | `/` | Dashboard (chat, hippocampus, brains, IoT, crypto, sensory, code, health) |
-| GET | `/api/health` · `/api/status` · `/api/brains` · `/api/domains` | Health report, metrics, cortex status, IoT stats |
+| GET | `/` | Dashboard (chat, hippocampus, brains, IoT, crypto, sensory, code, knowledge, health) |
+| GET | `/api/health` · `/api/status` · `/api/brains` · `/api/domains` | Health, metrics, cortices, IoT stats |
 | POST | `/api/chat` · `/api/learn` · `/api/document` · `/api/search` · `/api/sleep` · `/api/reset` | Cognitive operations |
-| POST | `/api/iot` | V11.2 production pipeline (SDRFilter + DomainBus) |
-| POST | `/api/crypto` | NexusGuardV11 encrypt/decrypt |
-| POST | `/api/code` | Code generation/execution (CodeGeneralizer) |
-| POST | `/api/sensory/image` · `/api/sensory/audio` | V13 encoders → SDR |
+| POST | `/api/ingest` | Corpus ingestion with dedup + provenance |
+| GET | `/api/provenance` · POST `/api/explain` · POST `/api/coverage` | Where knowledge came from, what is missing |
+| POST | `/api/iot` · `/api/crypto` · `/api/code` · `/api/sensory/{image,audio}` | Production, obfuscation, code, sensory |
 
-The UI uses relative `/api/...` paths, so it works behind any reverse proxy or container preview without host/port hardcoding.
+The UI uses relative `/api/...` paths, so it works behind any reverse proxy.
 
-### Tests
+## 🧪 Tests and CI
 
 ```bash
 python3 nexus_v14_shared_hippocampus.py --test   # 11/11 selftest · 34/34 integrated · 4/4 basics
-pytest -q                                        # 55 tests: kernel, production layer, HTTP server
+pytest -q                                        # 112 tests (kernel, production, HTTP, ingest)
+pytest -q -m "not slow"                          # skip the long demos
 ```
 
-## 📂 Repository Layout
+CI (`.github/workflows/ci.yml`) enforces the promises above:
+
+* **`kernel-sem-deps`** (Python 3.9, 3.11, 3.12) — installs *nothing* optional and
+  runs the full kernel suite, the demo, the production demo and a numpy-free
+  cipher check; then runs `pytest` with only `pytest` installed (HTTP tests skip).
+* **`completo`** — installs all requirements, runs the suite, boots the HTTP
+  server and hits `/api/health` + `/api/chat`, and runs the ingestion pipeline.
+* **`modularidade`** — verifies Python 3.9 syntax compatibility, that the kernel
+  works **alone** (copied to an empty directory) and that satellite modules
+  import (or fail with a clear message).
+
+## 📂 Repository layout
 
 | Path | Contents |
 | --- | --- |
-| `nexus_v14_shared_hippocampus.py` | The unified kernel (V10 cognitive core · V11.2 production · V13 sensory) + CLI |
-| `nexus_core.py` | Facade module — public API (`NexusV14Unified`, `NexusKernel`, …) |
+| `nexus_v14_shared_hippocampus.py` | The kernel: cognitive core + production layer + sensory encoders + CLI |
+| `nexus_core.py` | Stable import façade for the public API |
 | `nexus_server.py` | FastAPI HTTP layer + single-page dashboard |
-| `tests/` | pytest suite (`test_nexus_v14.py`) |
-| `requirements*.txt` | Optional kernel / server / dev dependencies |
+| `nexus_ingest.py` | Corpus ingestion pipeline (files, JSONL, Wikipedia) with provenance |
+| `tests/` | 112 tests: kernel, regressions, production, HTTP, ingestion |
+| `requirements*.txt` · `.github/workflows/ci.yml` | Optional deps and CI |
 | `nexus_v2_*.tar.gz`, `nexus_v4_final.tar.gz` | Archived earlier generations (untouched) |
 
-## 🔭 Future Applications
+**Why one big file?** The kernel is deliberately self-contained: copy
+`nexus_v14_shared_hippocampus.py` anywhere and it runs (CI proves it). New
+subsystems that do not need to be inside it live in satellite modules
+(`nexus_core`, `nexus_server`, `nexus_ingest`) — that is the modularisation
+strategy: extend outward, keep the single-file core portable. Extracting the
+13 k-line core into a package is possible but would trade away that property;
+it is not done.
 
-The Nexus Kernel is designed for integration where latency, privacy, and local autonomy are critical:
+## ⚠️ Known limitations
 
-* **Autonomous Drones:** semantic navigation and swarm intelligence without cloud dependency or GPS reliance.
-* **Robotics:** on-the-fly code generation via the CodeGeneralizer to solve novel mechanical problems through real-time Python sandboxing.
-* **Neural Prosthetics:** mapping neural intent to SDR signatures for organic-feeling bio-feedback loops and predictive movement.
+* **Not secure.** The XOR layer is obfuscation; see the matrix above before using
+  it for anything sensitive.
+* **Lexical epistemic gate.** Relevance uses shared content roots, so a fact
+  mentioning one root of the question can pass (`cromossomo` → fact about
+  `mitose`). It is conservative (false “I don’t know” is preferred over a false
+  answer), but it is not semantic understanding.
+* **No thread safety in the core.** The HTTP layer serialises access with a lock.
+* **State size** ≈5.3 MB per 300-token vocabulary (vectors are base64 float32);
+  a million facts has *not* been measured.
+* **No packaging/lint/type-checking yet** (`pyproject.toml`, mypy, ruff are open
+  work), and the abstract-method `NotImplementedError`s are by design.
+* **Code generation is retrieval, not synthesis** — it declines politely outside
+  its template library.
+
+## 🔭 Roadmap
+
+1. Semantic relevance stage on top of the lexical gate (embeddings alone are not
+   trustworthy enough to gate answers today).
+2. Packaging (`pyproject.toml`), type hints in the public surface, benchmarks for
+   latency/memory at scale.
+3. More ingestion sources (CSV/PDF, datasets) and coverage dashboards.
+4. Replace the demo obfuscation with a real authenticated cipher **or** remove it.
 
 ## ⚖ License
 

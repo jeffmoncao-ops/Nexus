@@ -1,0 +1,169 @@
+name: CI
+
+# Garantias que este pipeline verifica (e que o README promete):
+#   1. O kernel roda com ZERO dependências opcionais (fallback Python puro).
+#   2. Com as dependências instaladas, tudo (numpy/aiosqlite/fastapi) funciona.
+#   3. A sintaxe é compatível com Python 3.9+ (promessa de portabilidade).
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────────────
+  # Job 1 — SEM dependências: a promessa central do projeto.
+  # Nenhum pacote do requirements é instalado: se o kernel depender de algum
+  # import opcional, este job quebra.
+  # ────────────────────────────────────────────────────────────────────────────
+  kernel-sem-deps:
+    name: kernel puro (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.9', '3.11', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Confirma que não há deps opcionais instaladas
+        run: |
+          python -c "import importlib.util as u; import sys; \
+            assert u.find_spec('numpy') is None, 'numpy presente'; \
+            assert u.find_spec('fastapi') is None, 'fastapi presente'; \
+            print('ambiente limpo OK')"
+      - name: Autochecagem
+        run: python nexus_v14_shared_hippocampus.py --selfcheck
+      - name: Suíte completa (selftest + 34 testes + básicos)
+        run: python nexus_v14_shared_hippocampus.py --test
+      - name: Demo cognitiva + produção
+        run: |
+          python nexus_v14_shared_hippocampus.py --demo
+          python nexus_v14_shared_hippocampus.py --production
+      - name: Cifra/HMAC sem numpy (regressão do KDF)
+        run: |
+          python - <<'PY'
+          import sys; sys.path.insert(0, '.')
+          from nexus_core import NexusGuardV11, HAS_NUMPY
+          assert HAS_NUMPY is False, 'este job deve rodar sem numpy'
+          g = NexusGuardV11()
+          assert g.decrypt_payload(g.encrypt_payload('payload sem numpy')) == 'payload sem numpy'
+          assert g.verify('x', g.sign('x'))
+          print('KDF/HMAC puro OK')
+          PY
+      - name: Instala apenas pytest e roda a suíte (HTTP é pulado)
+        run: |
+          python -m pip install --quiet pytest
+          python -m pytest tests -q --tb=short -p no:cacheprovider
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Job 2 — COM dependências: caminho rápido (numpy, aiosqlite, fastapi).
+  # ────────────────────────────────────────────────────────────────────────────
+  completo:
+    name: com dependências
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Instala dependências do kernel, servidor e testes
+        run: python -m pip install -r requirements-dev.txt
+      - name: Autochecagem (deve reportar tudo disponível)
+        run: python nexus_v14_shared_hippocampus.py --selfcheck
+      - name: Suíte completa do kernel
+        run: python nexus_v14_shared_hippocampus.py --test
+      - name: Testes (inclui contrato HTTP/API)
+        run: python -m pytest tests -q --tb=short -p no:cacheprovider
+      - name: Servidor HTTP sobe e responde
+        run: |
+          python nexus_server.py 8099 &
+          SERVIDOR=$!
+          for i in $(seq 1 40); do
+            sleep 1
+            if curl -sf http://127.0.0.1:8099/api/health > /dev/null; then break; fi
+          done
+          curl -sf http://127.0.0.1:8099/api/health | head -c 200
+          echo
+          curl -sf -X POST http://127.0.0.1:8099/api/chat \
+            -H 'Content-Type: application/json' \
+            -d '{"text":"o que é fotossíntese?"}'
+          echo
+          kill $SERVIDOR
+      - name: Pipeline de ingestão ponta a ponta
+        run: |
+          mkdir -p /tmp/corpus
+          cat > /tmp/corpus/bio.md <<'MD'
+          A mitocôndria é a organela responsável pela respiração celular e produção de ATP.
+          O núcleo contém o material genético da célula eucariótica.
+          MD
+          python nexus_ingest.py --file /tmp/corpus/bio.md --report /tmp/ing.json --quiet
+          python - <<'PY'
+          import json
+          r = json.load(open('/tmp/ing.json'))
+          assert r['schema'] == 'nexus.ingest.report/1'
+          assert r['totals']['new_facts'] >= 1, r
+          assert r['provenance']['tracked'] >= 2
+          print('ingestão OK:', r['totals'])
+          PY
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Job 3 — Sintaxe/portabilidade e fumaça de importação de módulos isolados.
+  # ────────────────────────────────────────────────────────────────────────────
+  modularidade:
+    name: sintaxe 3.9+ e módulos satélites
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Compatibilidade de sintaxe com Python 3.9
+        run: |
+          python - <<'PY'
+          import ast, glob
+          arquivos = sorted(glob.glob('*.py') + glob.glob('tests/*.py'))
+          ruins = []
+          for f in arquivos:
+              try:
+                  ast.parse(open(f, encoding='utf-8').read(), filename=f,
+                            feature_version=(3, 9))
+              except SyntaxError as e:
+                  ruins.append(f'{f}: {e}')
+          assert not ruins, ruins
+          print(f'{len(arquivos)} arquivos compatíveis com Python 3.9')
+          PY
+      - name: Kernel é autossuficiente (roda sozinho, sem os módulos satélites)
+        run: |
+          python - <<'PY'
+          import importlib.util as u, pathlib, shutil, subprocess, sys, tempfile
+          # copia SÓ o kernel para um diretório vazio e verifica que ele funciona
+          tmp = tempfile.mkdtemp()
+          shutil.copy('nexus_v14_shared_hippocampus.py', tmp)
+          r = subprocess.run([sys.executable, 'nexus_v14_shared_hippocampus.py',
+                              '--selfcheck'], cwd=tmp, capture_output=True, text=True)
+          assert r.returncode == 0, r.stderr[-500:]
+          print('kernel autossuficiente OK:', r.stdout.strip())
+          PY
+      - name: Módulos satélites importam isoladamente (sem deps opcionais)
+        run: |
+          python - <<'PY'
+          import importlib
+          for mod in ['nexus_core', 'nexus_ingest']:
+              m = importlib.import_module(mod)
+              print(f'{mod} OK →', getattr(m, '__file__', ''))
+          # nexus_server exige fastapi: fora do job com deps ele deve falhar
+          # de forma AMIGÁVEL (SystemExit com instrução de instalação).
+          try:
+              import nexus_server  # noqa: F401
+              raise AssertionError('nexus_server importou sem fastapi — inesperado')
+          except SystemExit as e:
+              assert 'requirements-server.txt' in str(e), str(e)
+              print('nexus_server falha amigável sem fastapi OK')
+          PY
