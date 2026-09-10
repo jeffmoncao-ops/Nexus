@@ -462,6 +462,9 @@ class TestApiCompleta:
         st = client.get('/api/status').json()
         assert st['version'] == VERSION
         assert st['facts'] > 0 and st['brains'] == 8
+        prov = st.get('provenance') or {}
+        assert prov.get('tracked', 0) > 0, 'status deve expor a proveniência'
+        assert 0.0 < prov.get('coverage', 0) <= 1.0
 
     def test_ingestao_pela_api(self, client):
         d = client.post('/api/ingest', json={

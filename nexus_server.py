@@ -217,6 +217,7 @@ def status() -> Dict[str, Any]:
         "graphs": st.get("graph", {}),
         "embed_vocab": st.get("embed", 0),
         "brains": len(k.cognitive._brains),
+        "provenance": st.get("provenance"),
     }
 
 
