@@ -705,6 +705,7 @@ class MiniEmbed:
         self._ns_dirty:     bool      = True   # reconstrói na próxima NS
         # Cache de sentence_vector
         self._sv_cache:     Dict[str, List[float]] = {}
+        self._vec_cache:    Dict[str, List[float]] = {}
         self._sv_version:   int = 0
         # Contador de updates para decaimento de LR
         self._updates:      int = 0
@@ -995,6 +996,7 @@ class MiniEmbed:
                         dv[k] *= 0.9995
 
         self._sv_version += 1
+        self._vec_cache.clear()   # drift/subword mudaram — recomputa
 
     # ── Embedding final ────────────────────────────────────────────────────────
 
@@ -1012,6 +1014,12 @@ class MiniEmbed:
         Isso é a melhoria FastText: palavras desconhecidas recebem vetor útil.
         """
         w   = _deaccent(word.lower())
+        # V14.5: memoização — vector() é chamado milhões de vezes pela
+        # indução de regras/clustering (661k cosines medidas num treino
+        # de 120 fatos); o cálculo é determinístico entre learns
+        hit = self._vec_cache.get(w)
+        if hit is not None:
+            return hit
         iw  = self._input_vec.get(w)
         drv = self._drift_vec.get(w)
         sub = self._subword_vec(w)   # sempre calculado (OOV support)
@@ -1037,7 +1045,12 @@ class MiniEmbed:
             vec[k] += self.SUBWORD_WEIGHT * sub[k]
 
         norm = math.sqrt(sum(x*x for x in vec)) or 1.0
-        return [x/norm for x in vec]
+        result = [x/norm for x in vec]
+        if len(self._vec_cache) > 8192:
+            for k in list(self._vec_cache)[:4096]:
+                del self._vec_cache[k]
+        self._vec_cache[w] = result
+        return result
 
     def _pmi(self, w1: str, w2: str) -> float:
         key = (min(w1, w2), max(w1, w2))
@@ -1069,6 +1082,16 @@ class MiniEmbed:
         return result
 
     def cosine(self, v1: List[float], v2: List[float]) -> float:
+        # V14.5: caminho numpy — a indução de regras/clustering chama
+        # cosine O(n²) vezes por ciclo de sono (661k num treino de 120
+        # fatos medido); numpy corta ~20× (diferenças de arredondamento
+        # float64 ~1e-15, irrelevantes para limiares heurísticos)
+        if HAS_NUMPY:
+            a = np.asarray(v1, dtype=np.float64)
+            b = np.asarray(v2, dtype=np.float64)
+            n1 = float(np.sqrt(a @ a)) or 1e-9
+            n2 = float(np.sqrt(b @ b)) or 1e-9
+            return float(a @ b) / (n1 * n2)
         dot = sum(a*b for a, b in zip(v1, v2))
         n1  = math.sqrt(sum(x*x for x in v1)) or 1e-9
         n2  = math.sqrt(sum(x*x for x in v2)) or 1e-9
@@ -9445,6 +9468,7 @@ class NexusV10:
         # Invalidar cache de sv após restaurar ctx_vec
         self.embed._sv_cache.clear()
         self.embed._sv_version += 1
+        self.embed._vec_cache.clear()   # embed mudou — invalida memoização
 
         return True
 
@@ -9587,6 +9611,36 @@ class NexusV10:
             n._pending_confirm = None
         n._dialog_ctx = []  # não persistido — janela de diálogo reinicia a cada sessão
         n._facts_since_sleep = 0
+        # V14.5: módulos de RUNTIME não persistidos no snapshot — instanciam
+        # frescos (corrige AttributeError ao usar chat() em instância
+        # carregada: _ctx_entities, _curiosita, novelty, pred_cache etc.
+        # nunca eram setados porque load() cria via __new__, sem __init__)
+        n._ctx_entities   = []
+        n._ctx_topic_vec  = [0.0] * n.embed.DIM
+        n._facts_since_save = 0
+        n._autosave_every = 50
+        n._autosave_enabled = False
+        n._persist_path   = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), 'nexus_state.json')
+        n._ctx_turn     = 0
+        n.text_weaver   = TextWeaver(
+            embed=n.embed, concept_graph=n.concept_graph,
+            fact_store=n.fact_store, ngram=n.ngram,
+            deductive=n.deductive, conditional=n.conditional,
+            episodic=n.episodes)
+        n._tw           = n.text_weaver
+        n.beam_gen      = BeamGenerator(n.ngram, n.embed)
+        n.attn_pool     = AttentionPool(n.embed)
+        n._curiosita = CuriositaEngine()
+        n._checker   = ConsistencyChecker()
+        n._v12_stats = {"learned": 0, "blocked": 0}
+        n._dedup     = DeduplicatorSDR(n.encoder)
+        n.xor_bind   = XORBinding(n.encoder)
+        n.novelty    = NoveltyDetector()
+        n.temporal   = TemporalMemory()
+        n.sdr_reasoner = SDRReasoner()
+        n.pred_cache = PredictiveCache()
+        n.rep_bus    = RepresentationalBus()
         # V14: restaura córtex spiking (sinapses Hebbianas consolidadas)
         cortex_data = data.get('spiking_cortex')
         n.spiking_cortex = (SpikingCortex.from_dict(cortex_data)
@@ -9922,7 +9976,9 @@ class NexusV10:
                 self.rule_ind.apply_to_graph(self.concept_graph, self.edge_net)
         # Auto-consolidação a cada 50 fatos novos (silenciosa)
         self._facts_since_sleep += 1
-        if self._facts_since_sleep >= 50:
+        if self._facts_since_sleep >= 150:   # V14.5: era 50 — o sono
+            # consolida O(n²) no grafo de conceitos; em treino em lote,
+            # a cada 50 fatos o custo quadrático dominava o pipeline
             self.sleep(cycles=1)
             self._facts_since_sleep = 0
         # Auto-save periódico a cada N fatos

@@ -1,6 +1,10 @@
 # Modelo semântico local (90 MB) — instale com tools/bootstrap_encoder.py
 data/semantic/
 
+# Material de treino e modelos treinados (baixados sob demanda por
+# tools/train_from_web.py; não versionar dezenas de MB)
+data/trained/
+
 # Python
 __pycache__/
 *.pyc

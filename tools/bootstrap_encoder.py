@@ -57,10 +57,15 @@ def main() -> int:
             return 1
 
         print('[2/3] extraindo modelo...')
+        # o diretório interno do pacote usa UNDERSCORE (gt_all_minilm_l6_v2),
+        # não o nome do pacote com traços
+        prefixes = (f'{PKG}/model/', PKG.replace('-', '_') + '/model/')
         with zipfile.ZipFile(os.path.join(tmp, wheels[0])) as z:
             members = [n for n in z.namelist()
-                       if n.startswith(f'{PKG}/model/')
-                       and not n.endswith('/')]
+                       if n.startswith(prefixes) and not n.endswith('/')]
+            if not members:
+                print('[x] modelo não encontrado dentro do wheel')
+                return 1
             os.makedirs(MODEL_DIR, exist_ok=True)
             for n in members:
                 dest = os.path.join(MODEL_DIR, os.path.basename(n))

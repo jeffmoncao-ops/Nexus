@@ -97,6 +97,11 @@ The fly as an agent (T-maze): odor-approach conditioning, odor generalization vi
 
 python3 nexus_v14_shared_hippocampus.py --agent-demo
 
+Training from real web material (V14.5): learn from an actual public dataset — the PT-BR translation of SQuAD v1.1 (github.com/nunorc/squad-v1.1-pt), fetched from GitHub on first run — and evaluate with an honest two-axis protocol:
+python3 tools/train_from_web.py            # train on 10 articles + evaluate
+python3 tools/train_from_web.py --skip-train   # evaluate the saved model
+Measured on a 1,216-fact run (10 articles, one-shot learning, encoder frozen): RECALL on trained articles hit@5 6/30 strict / 9/30 lenient (vs 0/30 untrained); SPECIFICITY on never-seen articles 0/20 (does not fabricate what it never learned); end-to-end chat() 1/8. Includes a 16× training-pipeline speedup (numpy cosine + word-vector memoization + auto-sleep throttling — rule induction was calling cosine 661k times per sleep cycle in pure Python) and a fix to NexusV10.load() which created half-initialized instances (runtime modules like _curiosita, novelty, pred_cache and _ctx_entities were never restored).
+
 Installing the neural semantic encoder (optional — everything works without it, falling back to the deterministic hash):
 python3 tools/bootstrap_encoder.py        # MiniLM-L6-v2 local (numpy, offline, from PyPI)
 pip install numpy safetensors tokenizers  # dependencies of the local backend
