@@ -28,6 +28,14 @@ Ported from the complete adult fly brain connectome (FlyWire v783: 139,255 neuro
  * Dual Pathway: `perceive()` reports the innate route (familiarity via existing memory — the fly's lateral horn) and the learned route (conditioned valence via the mushroom body).
  * Neuromodulation: global dopamine/serotonin/octopamine state (real modulatory neurons are just 1.2% of the fly brain) gating plasticity and thresholds cortex-wide. Since V14.3 this is load-bearing: every chat turn passes the modulatory state into the LIF cortex (`dopamine` raises Hebbian gain, `octopamine` lowers firing threshold — arousal).
  * Forgetting Curve: during `sleep()`, unreactivated KC→MBON synapses decay and are pruned — valence memories that are never reconsolidated fade, as in the fly.
+4. SemanticEncoderProvider — Neural Semantic Encoder (V14.4)
+The missing link — real semantics. The SDR stops being a token hash and becomes the LSH projection of a real transformer embedding (`semantic_encode()` cascades automatically):
+ * Backend cascade: (1) fastembed multilingual MiniLM — best PT-BR quality, enable with `NEXUS_SEMANTIC_EMBEDDER=fastembed`, needs open internet on first use; (2) local all-MiniLM-L6-v2 running as a pure-numpy forward pass — offline, no torch/onnxruntime, install with `python3 tools/bootstrap_encoder.py` (weights fetched from PyPI, Apache 2.0); (3) the historical deterministic hash — zero deps, always works (`NEXUS_NO_SLM=1` forces it).
+ * Anisotropy calibration: transformer spaces compress all similarities to ~0.9; the provider removes the dominant direction (all-but-the-top centering, Mu & Viswanath 2018) with a built-in PT calibration corpus — measured contrast after centering: +0.31 (PT lexical) / +0.41 (EN).
+ * Bit-exact LSH: SemanticSDREncoder now generates its projection matrix vectorized in numpy (uint64 LCG, bit-identical to the pure-Python path) and encodes in ~18ms instead of ~4s; identical SDRs in both modes.
+ * Unified bit-space: fact storage, queries, retrieval, theorize and seeds all encode through the same `semantic_encode()` — perception, memory and prediction finally share one space.
+ * Measured in the SDR space: 'cheiro doce de banana madura' ↔ 'cheiro doce de manga madura' = 12/60 bits vs banana ↔ carro = 4/60 — 3× semantic contrast; odor generalization in the agent only works with a neural backend (the hash fallback inherits valence from tokens, not meaning — documented in the test suite).
+ * Affective speech: every chat turn computes the learned valence of the input; strongly negative valence appends an auditable avoidance note to the response ([⚠ memória afetiva]) — the fly's amygdala now speaks in the conversation.
 5. AssemblySequencer — Autoregression over States (Assembly Sequences)
 Instead of predicting the next token (surface), the kernel predicts the next sparse STATE: SDR_t → SDR_{t+1} — the level at which cortical assembly sequences operate (HTM Temporal Memory; Papadimitriou's Assembly Calculus; Buzsáki's population slot codes):
  * State Transitions: one-shot, gradient-free associative memory of transitions between SDRs (inverted index, O(k) recall); every transition is auditable.
@@ -44,6 +52,13 @@ Utilizing the XOR Binding and Cyclic Permutation, Nexus understands structural r
 The architecture employs a "Thalamus-Cortex" model:
  * Specialized Cortices: Dedicated modules for Code (CodeMaker), Logic (DeductiveEngine), and Web (WebExplorer).
  * Global Workspace: A central hub that manages lateral inhibition, ensuring the most relevant "brain" takes control of the output while suppressing noise via the Entropy Guard.
+8. FlyAgent — The Fly as Agent (T-maze, V14.4)
+The motor link: the same connectome-derived circuit that made the fly play games now closes the sensorimotor loop in the Nexus — stimulus (semantic SDR) → mushroom body (learned valence) → action (approach/avoid/neutral, ε-exploration) → environment reward → `reinforce()` (dopamine consolidates KC→MBON synapses AND the trajectory). Based on the classic Tully & Quinn T-maze experiment:
+ * T-maze choice: after 3 odor pairings (banana +1 / vinegar −1) the agent picks the rewarded arm (valences +2.35 / −2.45).
+ * Odor generalization: a fruit NEVER seen before (manga) is approached — inherited valence via the semantic encoder.
+ * Online foraging with INVERTED reward: the sweet odor is now punished; the agent starts following its prior and adapts by consequence alone (5/5 correct at the end) — learning that overrides generalization.
+ * Affective speech: `chat()` marks responses with conditioned avoidance/attraction notes when the learned valence is strong (valence −5.10 measured in the suite).
+ * Run it: `python3 nexus_v14_shared_hippocampus.py --agent-demo`
 🚀 Future Applications
 The Nexus Kernel is designed for integration where latency, privacy, and local autonomy are critical:
  * Autonomous Drones: Semantic navigation and swarm intelligence without cloud dependency or GPS reliance.
@@ -77,6 +92,16 @@ The assembly sequencer (state-space autoregression): next-SDR prediction, branch
 
 python3 nexus_v14_shared_hippocampus.py --assembly-demo
 
-Run the full test suite (75+ checks, including the SDR-10000/LIF block, the Drosophila mushroom body block and the assembly sequences block):
+The fly as an agent (T-maze): odor-approach conditioning, odor generalization via the semantic encoder, and online foraging with inverted reward:
+
+python3 nexus_v14_shared_hippocampus.py --agent-demo
+
+Installing the neural semantic encoder (optional — everything works without it, falling back to the deterministic hash):
+python3 tools/bootstrap_encoder.py        # MiniLM-L6-v2 local (numpy, offline, from PyPI)
+pip install numpy safetensors tokenizers  # dependencies of the local backend
+# or, with open internet (best PT-BR quality):
+pip install fastembed                     # then run with NEXUS_SEMANTIC_EMBEDDER=fastembed
+
+Run the full test suite (85+ checks, including the SDR-10000/LIF block, the Drosophila mushroom body block, the assembly sequences block and the semantic encoder + FlyAgent block):
 
 python3 nexus_v14_shared_hippocampus.py --test

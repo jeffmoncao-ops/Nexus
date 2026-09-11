@@ -1,0 +1,6 @@
+# Modelo semântico local (90 MB) — instale com tools/bootstrap_encoder.py
+data/semantic/
+
+# Python
+__pycache__/
+*.pyc

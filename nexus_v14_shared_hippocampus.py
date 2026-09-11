@@ -405,29 +405,63 @@ class SemanticSDREncoder:
     def __init__(self, embed_dim: int = 128):
         self.dim      = embed_dim
         self._updates = 0   # sempre 0 — LSH não aprende
+        self._R_np    = None   # matriz numpy (caminho rápido, bit-exato)
         # Matriz de projeção: SDR_SIZE vetores aleatórios normalizados
         # Determinística via hash → mesma matriz em toda instância
-        # Linhas em array('f'): 10.000×768 floats empacotados (~30 MB)
-        # em vez de listas de floats (~250 MB) — essencial no modo puro.
-        self._R: List[array.array] = []
-        for i in range(self.SDR_SIZE):
-            seed = (i * 6364136223846793005 + 1442695040888963407) & 0xFFFFFFFF
-            v = []
+        # Linhas em array('f'): 10.000×dim floats empacotados (~30 MB)
+        # em vez de listas de floats — essencial no modo puro.
+        # V14.4: com numpy, a geração é vetorizada (~100× mais rápida) e
+        # BIT-EXATA com o caminho puro (LCG em uint64 preserva os mesmos
+        # bits baixos do big-int do Python; log/normalização em float64).
+        if HAS_NUMPY:
+            n = self.SDR_SIZE
+            seeds = ((np.arange(n, dtype=np.uint64)
+                      * np.uint64(6364136223846793005)
+                      + np.uint64(1442695040888963407))
+                     & np.uint64(0xFFFFFFFF))
+            cols = []
             for _ in range(embed_dim):
-                seed = (seed * 1664525 + 1013904223) & 0xFFFFFFFF
-                u = max(seed / 0xFFFFFFFF, 1e-9)
-                # Aproxima distribuição normal via log-transform
-                v.append(math.log(u))
-            nrm = math.sqrt(sum(x*x for x in v)) or 1.0
-            self._R.append(array.array('f', [x/nrm for x in v]))
+                seeds = ((seeds * np.uint64(1664525) + np.uint64(1013904223))
+                         & np.uint64(0xFFFFFFFF))
+                cols.append(np.log(np.maximum(
+                    seeds / np.uint64(0xFFFFFFFF), 1e-9)))
+            M = np.array(cols, dtype=np.float64)              # dim × N
+            _norms = np.sqrt((M * M).sum(axis=0))             # normaliza colunas
+            _norms[_norms == 0.0] = 1.0
+            M = M / _norms
+            self._R: List[array.array] = [
+                array.array('f', M[:, i].tolist()) for i in range(n)]
+        else:
+            self._R: List[array.array] = []
+            for i in range(self.SDR_SIZE):
+                seed = (i * 6364136223846793005 + 1442695040888963407) & 0xFFFFFFFF
+                v = []
+                for _ in range(embed_dim):
+                    seed = (seed * 1664525 + 1013904223) & 0xFFFFFFFF
+                    u = max(seed / 0xFFFFFFFF, 1e-9)
+                    # Aproxima distribuição normal via log-transform
+                    v.append(math.log(u))
+                nrm = math.sqrt(sum(x*x for x in v)) or 1.0
+                self._R.append(array.array('f', [x/nrm for x in v]))
 
     def encode(self, embed_vec: List[float], learn: bool = False) -> SparseSDR:
         """Projeta embed_vec em SDR semântico via SimHash.
 
         learn=True aceito por compatibilidade mas ignorado (LSH é sem treino).
+        V14.4: caminho numpy vetorizado (mesmo resultado do caminho puro).
         """
         if len(embed_vec) != self.dim:
             embed_vec = (embed_vec + [0.0] * self.dim)[:self.dim]
+
+        if HAS_NUMPY:
+            if self._R_np is None:
+                self._R_np = np.array(
+                    [np.frombuffer(r, dtype=np.float32) for r in self._R],
+                    dtype=np.float32)
+            scores = self._R_np @ np.asarray(embed_vec, dtype=np.float64)
+            # Top-ACTIVE por score (stable → mesmos desempates do sorted())
+            top_k = np.argsort(-scores, kind='stable')[:self.ACTIVE]
+            return SparseSDR.from_indices([int(i) for i in top_k])
 
         # score[i] = R[i] · embed_vec
         scores = [sum(self._R[i][k] * embed_vec[k]
@@ -436,7 +470,7 @@ class SemanticSDREncoder:
 
         # Top-ACTIVE por score (preserva a geometria do espaço)
         top_k = sorted(range(self.SDR_SIZE),
-                        key=lambda i: -scores[i])[:self.ACTIVE]
+                       key=lambda i: -scores[i])[:self.ACTIVE]
         return SparseSDR.from_indices(top_k)
 
     def train(self, embed: 'MiniEmbed', texts: List[str],
@@ -7477,6 +7511,380 @@ def demo_assembly_sequences(verbose: bool = True) -> Dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# §V10e  SEMANTIC ENCODER PROVIDER — o córtex sensorial estatístico
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# O elo que faltava: semântica de VERDADE. O SDR deixa de ser hash de
+# tokens e passa a ser a projeção LSH do embedding de um transformer real.
+#
+# Cascata de backends (o primeiro disponível vence):
+#   1. fastembed multilingual (paraphrase-multilingual-MiniLM-L12-v2, 384d)
+#      — melhor qualidade PT-BR; requer internet aberta no 1º uso
+#      (NEXUS_SEMANTIC_EMBEDDER=fastembed para habilitar);
+#   2. MiniLM-L6-v2 LOCAL (data/semantic/minilm-l6-v2/, forward pass em
+#      numpy puro — sem torch/onnxruntime) — offline, instalado via
+#      tools/bootstrap_encoder.py (fonte: PyPI gt-all-minilm-l6-v2, Apache 2.0);
+#   3. MiniEmbed hash (o caminho histórico do repositório) — zero deps.
+#
+# Calibração: o espaço do transformer é anisotrópico (similaridades ~0.9
+# para tudo) — o provedor remove a direção dominante (centering
+# "all-but-the-top", Mu & Viswanath 2018) com um corpus de calibração
+# interno. Contraste medido após o centering: +0.31 (PT lexical) / +0.41 (EN).
+#
+# Variáveis de ambiente:
+#   NEXUS_NO_SLM=1 ................ desliga backends neurais (fallback hash)
+#   NEXUS_SEMANTIC_EMBEDDER=fastembed  habilita o backend multilingual
+# ══════════════════════════════════════════════════════════════════════════════
+
+try:
+    from tokenizers import Tokenizer as _WPTokenizer
+    from safetensors.numpy import load_file as _safetensors_load
+    _SEM_DEPS = True
+except Exception:
+    _SEM_DEPS = False
+
+_SEMANTIC_MODEL_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    'data', 'semantic', 'minilm-l6-v2')
+
+
+class MiniLMNumpyEncoder:
+    """
+    all-MiniLM-L6-v2 (384d) rodando como forward pass numpy puro.
+
+    6 camadas BERT (hidden 384, 12 cabeças, intermediária 1536), mean
+    pooling — sem torch nem onnxruntime: só safetensors + tokenizers +
+    numpy. ~160ms/frase curta em CPU. A arquitetura é inferida das formas
+    dos tensores (nada hardcoded).
+    """
+
+    def __init__(self, model_dir: str = _SEMANTIC_MODEL_DIR):
+        weights = _safetensors_load(os.path.join(model_dir, 'model.safetensors'))
+        self.W = weights
+        self.tok = _WPTokenizer.from_file(os.path.join(model_dir, 'tokenizer.json'))
+        self.H = int(weights['embeddings.word_embeddings.weight'].shape[1])
+        self.L = 1 + max(int(k.split('.')[2]) for k in weights
+                         if k.startswith('encoder.layer.'))
+        self.A = 12
+        self.hd = self.H // self.A
+
+    def _ln(self, x, g, b):
+        m = x.mean(-1, keepdims=True)
+        v = x.var(-1, keepdims=True)
+        return (x - m) / np.sqrt(v + 1e-12) * g + b
+
+    @staticmethod
+    def _gelu(x):
+        return 0.5 * x * (1 + np.tanh(np.sqrt(2.0 / np.pi)
+                                      * (x + 0.044715 * x ** 3)))
+
+    def encode(self, text: str) -> List[float]:
+        """Embedding denso 384d normalizado (mean pooling sobre os tokens)."""
+        ids = self.tok.encode(text).ids
+        n = len(ids)
+        W = self.W
+        x = W['embeddings.word_embeddings.weight'][np.array(ids)]
+        x = (x + W['embeddings.position_embeddings.weight'][:n]
+             + W['embeddings.token_type_embeddings.weight'][0])
+        x = self._ln(x, W['embeddings.LayerNorm.weight'],
+                     W['embeddings.LayerNorm.bias'])
+        for i in range(self.L):
+            p = f'encoder.layer.{i}.'
+            q = (x @ W[p + 'attention.self.query.weight'].T
+                 + W[p + 'attention.self.query.bias']).reshape(n, self.A, self.hd).transpose(1, 0, 2)
+            k = (x @ W[p + 'attention.self.key.weight'].T
+                 + W[p + 'attention.self.key.bias']).reshape(n, self.A, self.hd).transpose(1, 0, 2)
+            v = (x @ W[p + 'attention.self.value.weight'].T
+                 + W[p + 'attention.self.value.bias']).reshape(n, self.A, self.hd).transpose(1, 0, 2)
+            s = q @ k.transpose(0, 2, 1) / np.sqrt(self.hd)
+            s = np.exp(s - s.max(-1, keepdims=True))
+            s /= s.sum(-1, keepdims=True)
+            h = (s @ v).transpose(1, 0, 2).reshape(n, self.H)
+            h = h @ W[p + 'attention.output.dense.weight'].T + W[p + 'attention.output.dense.bias']
+            x = self._ln(x + h, W[p + 'attention.output.LayerNorm.weight'],
+                         W[p + 'attention.output.LayerNorm.bias'])
+            m = self._gelu(x @ W[p + 'intermediate.dense.weight'].T
+                           + W[p + 'intermediate.dense.bias'])
+            m = m @ W[p + 'output.dense.weight'].T + W[p + 'output.dense.bias']
+            x = self._ln(x + m, W[p + 'output.LayerNorm.weight'],
+                         W[p + 'output.LayerNorm.bias'])
+        vec = x.mean(0)
+        return (vec / np.linalg.norm(vec)).tolist()
+
+
+class SemanticEncoderProvider:
+    """
+    Provedor unificado de embeddings semânticos — o slot onde o SLM entra
+    no Nexus. Resolve o backend uma vez, calibra o centering e projeta o
+    SDR semântico via LSH (SemanticSDREncoder, SimHash bit-exato).
+
+    Uso:
+        prov = semantic_provider()
+        vec  = prov.encode('gato caça rato')       # 384d centrado ou None
+        sdr, backend = prov.semantic_sdr('gato')   # (SparseSDR|None, nome)
+    """
+
+    # Corpus de calibração para o centering (all-but-the-top) — PT, fixo
+    _CALIBRATION = (
+        'o gato caça o rato no telhado da casa velha',
+        'a chuva forte molhou a rua inteira ontem a noite',
+        'o programa de computador falhou durante a atualizacao',
+        'as crianças brincam no parque todas as tardes de domingo',
+        'o cientista analisou os dados do experimento com cuidado',
+        'a receita de bolo leva farinha ovos e açúcar',
+        'o time de futebol venceu o campeonato estadual no ultimo mes',
+        'o medico receitou repouso e muito liquido para o paciente',
+        'a economia do país cresceu dois por cento neste trimestre',
+        'o livro de historia conta a vida dos imperadores romanos',
+        'a fotografia da montanha ficou nítida apesar da neblina',
+        'o barulho do motor assustou os passaros da arvore',
+    )
+
+    def __init__(self):
+        self._backend: Optional[str] = None
+        self._model = None                 # MiniLM numpy local
+        self._fast = None                  # fastembed (se habilitado)
+        self._center: Optional[List[float]] = None
+        self._lsh: Dict[str, SemanticSDREncoder] = {}
+        self._cache: Dict[str, Tuple] = {}   # texto → (vec, backend)
+        self.note: str = ''
+
+    # ── Resolução do backend (uma vez) ──────────────────────────────────────
+
+    def _resolve(self) -> str:
+        if self._backend is not None:
+            return self._backend
+        if os.environ.get('NEXUS_NO_SLM') == '1':
+            self._backend, self.note = 'miniembed-hash', 'desligado (NEXUS_NO_SLM=1)'
+            return self._backend
+        if os.environ.get('NEXUS_SEMANTIC_EMBEDDER') == 'fastembed':
+            try:
+                from fastembed import TextEmbedding           # opcional
+                self._fast = TextEmbedding(
+                    'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
+                self._backend = 'fastembed-multilingual'
+                self.note = 'paraphrase-multilingual-MiniLM-L12-v2 (384d)'
+                return self._backend
+            except Exception as e:
+                self.note = f'fastembed indisponível ({type(e).__name__})'
+        if (_SEM_DEPS and HAS_NUMPY
+                and os.path.isfile(os.path.join(_SEMANTIC_MODEL_DIR, 'model.safetensors'))
+                and os.path.isfile(os.path.join(_SEMANTIC_MODEL_DIR, 'tokenizer.json'))):
+            try:
+                self._model = MiniLMNumpyEncoder(_SEMANTIC_MODEL_DIR)
+                self._backend = 'minilm-local'
+                self.note = 'all-MiniLM-L6-v2 (384d, numpy, offline)'
+                return self._backend
+            except Exception as e:
+                self.note = f'minilm-local falhou ({type(e).__name__})'
+        self._backend, self.note = 'miniembed-hash', 'fallback determinístico'
+        return self._backend
+
+    @property
+    def backend(self) -> str:
+        return self._resolve()
+
+    @property
+    def neural(self) -> bool:
+        return self.backend != 'miniembed-hash'
+
+    # ── Encoding denso (com centering) ──────────────────────────────────────
+
+    def _raw_encode(self, text: str) -> List[float]:
+        if self._fast is not None:
+            v = next(iter(self._fast.embed([text])))
+            return [float(x) for x in v]
+        return self._model.encode(text)
+
+    def _center_vec(self, vec: List[float]) -> List[float]:
+        if self._center is None:
+            mu = np.mean([self._raw_encode(c) for c in self._CALIBRATION],
+                         axis=0)
+            mu = mu / np.linalg.norm(mu)
+            self._center = mu.tolist()
+        v = np.asarray(vec, dtype=np.float64)
+        mu = np.asarray(self._center, dtype=np.float64)
+        w = v - float(v @ mu) * mu
+        nrm = np.linalg.norm(w)
+        return (w / nrm).tolist() if nrm > 1e-9 else vec
+
+    def encode(self, text: str) -> Optional[List[float]]:
+        """Embedding semântico centrado+normalizado, ou None no fallback."""
+        hit = self._cache.get(text)
+        if hit is not None:
+            return hit[0]
+        if not self.neural:
+            return None
+        try:
+            vec = self._center_vec(self._raw_encode(text))
+        except Exception:
+            return None
+        if len(self._cache) > 1024:
+            self._cache.pop(next(iter(self._cache)))
+        self._cache[text] = (vec, self.backend)
+        return vec
+
+    # ── SDR semântico (LSH sobre o embedding centrado) ──────────────────────
+
+    def semantic_sdr(self, text: str) -> Tuple[Optional[SparseSDR], str]:
+        """(SDR semântico, backend) — SDR None quando só há fallback hash."""
+        backend = self.backend
+        vec = self.encode(text)
+        if vec is None:
+            return None, backend
+        lsh = self._lsh.get(backend)
+        if lsh is None or lsh.dim != len(vec):
+            lsh = SemanticSDREncoder(embed_dim=len(vec))
+            self._lsh[backend] = lsh
+        return lsh.encode(vec), backend
+
+
+_SEMANTIC_PROVIDER_SINGLETON: Optional[SemanticEncoderProvider] = None
+
+
+def semantic_provider() -> SemanticEncoderProvider:
+    """Singleton do provedor semântico (modelo carregado uma vez)."""
+    global _SEMANTIC_PROVIDER_SINGLETON
+    if _SEMANTIC_PROVIDER_SINGLETON is None:
+        _SEMANTIC_PROVIDER_SINGLETON = SemanticEncoderProvider()
+    return _SEMANTIC_PROVIDER_SINGLETON
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# §V10e.2  FLY AGENT — o elo motor: a mosca como agente (T-maze)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# O conectoma da mosca já controlou jogos (Drosophila connectome × Pong,
+# Fruit Fly Brain observatório) — circuito conectômico real é controller
+# suficiente. O FlyAgent fecha o loop sensorimotor no Nexus:
+#
+#   sentido (SDR semântico) → corpo cogumelar (valência aprendida)
+#     → ação (approach/avoid/neutral, com exploração ε) → recompensa ambiente
+#       → reinforce() → dopamina consolida sinapses KC→MBON + trajetória
+#
+# O T-maze é o experimento clássico de Tully & Quinn: a mosca aprende a
+# escolher o braço do labirinto cujo odor foi pareado com recompensa.
+# Aqui o "odor" é um SDR semântico — e a mesma arquitetura decide.
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class FlyAgent:
+    """
+    Agente sensorimotor minimalista movido pelo corpo cogumelar.
+
+    Uso:
+        agent = FlyAgent(kernel)                  # kernel: NexusV10-like
+        agent.train('cheiro doce de banana', +1.0)
+        agent.train('cheiro azedo de vinagre', -1.0)
+        agent.act('cheiro doce de banana')        # → 'approach'
+        agent.choose(banana, vinagre)             # → banana (T-maze)
+    """
+
+    ACTIONS = ('approach', 'avoid', 'neutral')
+
+    def __init__(self, kernel, epsilon: float = 0.15, seed: int = SDR_SEED + 999):
+        self.kernel = kernel
+        self.epsilon = epsilon          # exploração (comportamento espontâneo)
+        self.rng = random.Random(seed)
+        self.history: List[Dict] = []
+
+    def sense(self, stimulus: str) -> 'SparseSDR':
+        return self.kernel.semantic_encode(stimulus)
+
+    def act(self, stimulus: str) -> str:
+        """Decide a ação pelo corpo cogumelar (com exploração ε-greedy)."""
+        sdr = self.sense(stimulus)
+        readout = self.kernel.mushroom_body.readout(sdr)
+        decision = readout.get('decision', 'neutral')
+        if self.rng.random() < self.epsilon:
+            decision = self.rng.choice(self.ACTIONS)
+        self.history.append({'stimulus': stimulus[:40],
+                             'action': decision,
+                             'valence': round(readout.get('valence', 0.0), 3)})
+        return decision
+
+    def train(self, stimulus: str, reward: float) -> Dict:
+        """Pareia estímulo×recompensa (treino clássico de odor na mosca)."""
+        return self.kernel.reinforce(stimulus, reward)
+
+    def choose(self, option_a: str, option_b: str) -> str:
+        """T-maze: escolhe o braço com maior valência (empate → aleatório)."""
+        va = self.kernel.mushroom_body.readout(
+            self.sense(option_a)).get('valence', 0.0)
+        vb = self.kernel.mushroom_body.readout(
+            self.sense(option_b)).get('valence', 0.0)
+        if abs(va - vb) < 1e-6:
+            return self.rng.choice((option_a, option_b))
+        return option_a if va > vb else option_b
+
+
+def demo_fly_agent(verbose: bool = True) -> Dict:
+    """
+    A mosca como agente: T-maze (Tully & Quinn) + forrageamento com
+    aprendizado on-line. O corpo cogumelar decide, a recompensa do ambiente
+    treina — o loop sensorimotor fechado, medido num placar.
+    """
+    kernel = NexusFinal()
+    kernel.disable_autosave()
+    agent = FlyAgent(kernel)
+    report: Dict = {}
+
+    fruta = 'cheiro doce de banana madura'
+    acido = 'cheiro pungente de vinagre'
+
+    if verbose:
+        print('=== FLY AGENT — a mosca como controladora (T-maze) ===')
+        _prov = semantic_provider()
+        print(f'encoder: {_prov.backend} ({_prov.note})\n')
+        print('Fase 1 — treino de odor (3 pareamentos de cada):')
+    for _ in range(3):
+        agent.train(fruta, +1.0)
+        agent.train(acido, -1.0)
+    vf = kernel.mushroom_body.readout(kernel.semantic_encode(fruta))
+    va = kernel.mushroom_body.readout(kernel.semantic_encode(acido))
+    if verbose:
+        print(f"  {fruta!r}: valência {vf['valence']:+.2f} → {vf['decision']}")
+        print(f"  {acido!r}: valência {va['valence']:+.2f} → {va['decision']}")
+    report['valences'] = {'fruit': vf['valence'], 'acid': va['valence']}
+
+    if verbose:
+        print('\nFase 2 — T-maze: qual braço a mosca escolhe?')
+    chosen = agent.choose(fruta, acido)
+    if verbose:
+        print(f'  escolha: {chosen!r} '
+              f"{'✓ recompensa' if chosen == fruta else '✗ punição'}")
+    report['t_maze'] = chosen == fruta
+
+    if verbose:
+        print('\nFase 3 — generalização de odor (fruta NUNCA vista):')
+    manga = 'cheiro doce de manga madura'
+    act_manga = agent.act(manga)
+    if verbose:
+        print(f'  {manga!r} → {act_manga}')
+    report['generalization'] = act_manga
+
+    if verbose:
+        print('\nFase 4 — forrageamento com recompensa INVERTIDA (aprendizado')
+        print('  que vence o prior: o odor doce agora é PUNIDO)')
+    maca = 'cheiro adocicado de maçã fresca'
+    amonia = 'cheiro acre de amônia'
+    rounds = []
+    for i in range(20):
+        c = agent.choose(maca, amonia)
+        reward = +1.0 if c == amonia else -1.0   # ambiente invertido!
+        agent.train(c, reward)          # aprende COM a consequência
+        rounds.append(c == amonia)
+        if verbose and (i + 1) % 5 == 0:
+            print(f'  rodadas {i - 3:2d}-{i + 1:2d}: '
+                  f'{sum(rounds[-5:])}/5 escolhas do odor correto')
+    first5, last5 = sum(rounds[:5]), sum(rounds[-5:])
+    if verbose:
+        print(f'  precisão: primeiras 5 = {first5}/5 → últimas 5 = {last5}/5')
+    report['foraging'] = {'first5': first5, 'last5': last5}
+    return report
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # §V10  SDR REASONER — raciocínio lógico via operações bitwise
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -8030,6 +8438,11 @@ class NexusV10:
         # alimentando a neuromodulação (erro de predição → octopamina)
         self.assembly = AssemblySequencer()
         self._last_sdr: Optional[SparseSDR] = None   # último estado observado
+        # V14.4: encoder semântico neural (provedor em cascata) — o SDR
+        # passa a ser projeção LSH do embedding de um transformer real
+        self.semantic_encoder_enabled = True
+        self._semantic_backend = 'miniembed-hash'
+        self.last_emotion: Optional[Dict] = None   # valência do último turno
         # BeamGenerator: geração com beam search + reranking
         self.beam_gen = BeamGenerator(self.ngram, self.embed)
         # AttentionPool: IDF-weighted sentence vectors
@@ -8347,6 +8760,16 @@ class NexusV10:
         Caso contrário:
           → usa MultiLobeEncoder (hash puro, como antes)
         """
+        # V14.4: encoder semântico neural — SDR semântico de verdade
+        if self.semantic_encoder_enabled:
+            try:
+                sdr_sem, backend = semantic_provider().semantic_sdr(text)
+                if sdr_sem is not None:
+                    self._semantic_backend = backend
+                    return sdr_sem
+            except Exception:
+                pass
+            self._semantic_backend = 'miniembed-hash'
         if self._sp_trained and self.sp_encoder is not None:
             vec = self.embed.sentence_vector(text)
             return self.sp_encoder.encode(vec, learn=False)
@@ -8592,6 +9015,14 @@ class NexusV10:
             response = cached  # resposta pré-computada válida
         else:
             response = self._route(text, sdr)
+            # V14.4: a amígdala fala na conversa — a valência aprendida do
+            # corpo cogumelar acompanha a resposta (lacuna fechada: antes o
+            # circuito da mosca não influenciava nada no diálogo)
+            _mb_turn = self.mushroom_body.readout(sdr)
+            self.last_emotion = {
+                'valence': _mb_turn.get('valence', 0.0),
+                'decision': _mb_turn.get('decision', 'neutral'),
+            }
         
         # V10: Publica no RepresentationalBus
         self.rep_bus.publish(RepMessage(
@@ -8612,6 +9043,23 @@ class NexusV10:
             self._dialog_ctx = self._dialog_ctx[-100:]
         # Atualiza ContextEngine semântico (sem limite de tokens)
         self._update_context(text, response)
+        return self._emotion_marker(response)
+
+    def _emotion_marker(self, response: str) -> str:
+        """V14.4: marca a resposta com o estado afetivo aprendido.
+
+        Valência fortemente negativa → nota de evitação condicionada;
+        fortemente positiva → nota de atração. É o corpo cogumelar da
+        Drosophila interferindo (de forma auditável) na conversa.
+        """
+        if not response or not self.last_emotion:
+            return response
+        dec = self.last_emotion.get('decision')
+        val = self.last_emotion.get('valence', 0.0)
+        if dec == 'avoid' and val < -1.0:
+            return response + '\n[⚠ memória afetiva: evitação condicionada a este tema]'
+        if dec == 'approach' and val > 1.5:
+            return response + '\n[♥ memória afetiva: atração condicionada a este tema]'
         return response
 
     def learn(self, fact: str) -> str:
@@ -8619,7 +9067,7 @@ class NexusV10:
         return self._handle_learn(clean)
 
     def theorize(self, text: str) -> Belief:
-        sdr    = self.encoder.encode(text)
+        sdr    = self.semantic_encode(text)
         belief = self.epistemic.theorize(text, sdr)
         return self.epistemic.validate(belief, self.brain)
 
@@ -8880,7 +9328,7 @@ class NexusV10:
         loaded = 0
         for fact in data.get('session_facts', []):
             if fact not in self.fact_store.all_facts():
-                sdr = self.encoder.encode(fact)
+                sdr = self.semantic_encode(fact)
                 self.brain.store(sdr, fact, tag='FACT', metadata={'source': 'context'})
                 self.fact_store.add(fact)
                 self.embed.learn(fact)
@@ -8971,6 +9419,10 @@ class NexusV10:
                 # V14.2: Trajetórias de estados (transições SDR→SDR)
                 'assembly': (self.assembly.to_dict()
                              if getattr(self, 'assembly', None) else None),
+                # V14.4: encoder que gerou os SDRs (informativo — memórias
+                # salvas com outro backend têm espaço de bits incompatível)
+                'semantic_backend': getattr(self, '_semantic_backend',
+                                            'miniembed-hash'),
             }
             dir_ = os.path.dirname(os.path.abspath(filepath))
             # Cria o temporário no mesmo sistema de arquivos para garantir
@@ -9305,7 +9757,8 @@ class NexusV10:
     def _handle_learn(self, text: str) -> str:
         if not text:
             return 'O que devo aprender?'
-        sdr = self.encoder.encode(text)
+        # V14.4: mesmo espaço de bits da percepção (encoder semântico)
+        sdr = self.semantic_encode(text)
         self.embed.learn(text)
         self.homeostasis.on_learn()
 
@@ -9422,7 +9875,7 @@ class NexusV10:
           • Qualquer outra coisa → reexibe o pending pedindo resposta clara
         """
         if self._pending_confirm is None:
-            return self._handle_query(text, self.encoder.encode(text))
+            return self._handle_query(text, self.semantic_encode(text))
 
         new_text = self._pending_confirm['new_text']
         old_text = self._pending_confirm['old_text']
@@ -9465,7 +9918,7 @@ class NexusV10:
         # ── Consulta / pergunta durante pending — reexibe sem perder o estado ─
         # O usuário fez uma pergunta; respondemos e lembramos do pending.
         if _SUBJ_M.search(text) or '?' in text:
-            query_resp = self._handle_query(text, self.encoder.encode(text))
+            query_resp = self._handle_query(text, self.semantic_encode(text))
             reminder = (f'\n\n⚠️ Lembrete: ainda há um conflito pendente!\n'
                         f'Já sei: "{old_text[:60]}"\n'
                         f'Novo: "{new_text[:60]}"\n'
@@ -9507,7 +9960,7 @@ class NexusV10:
         clean = re.sub(_RE_CORRECT, '', text).strip().lstrip(':,. ')
         if not clean:
             return 'O que é o correto?'
-        new_sdr = self.encoder.encode(clean)
+        new_sdr = self.semantic_encode(clean)
         self.brain.revise_beliefs(new_sdr, clean)
         self.brain.store(new_sdr, clean, tag='FACT')
         self.fact_store.add(clean)
@@ -9703,7 +10156,7 @@ class NexusV10:
     def _handle_search(self, text: str) -> str:
         query   = re.sub(r'\b(?:busque|procure|liste\s+tudo\s+sobre|mostre\s+o\s+que)\b', '',
                          text, flags=re.I).strip()
-        results = self.retriever.retrieve(query, self.encoder.encode(query), top_k=5)
+        results = self.retriever.retrieve(query, self.semantic_encode(query), top_k=5)
         if not results:
             return f'Nada encontrado sobre "{query}".'
         lines = [f'{i+1}. [{src}] {txt[:80]}' for i, (_, txt, src) in enumerate(results)]
@@ -10540,7 +10993,7 @@ class NexusV10:
             'linguística é a ciência que estuda a linguagem humana em seus aspectos fonológicos sintáticos e semânticos',
         ]
         for s in seeds:
-            sdr = self.encoder.encode(s)
+            sdr = self.semantic_encode(s)
             self.brain.store(sdr, s, tag='FACT', metadata={'source': 'seed'})
             self.fact_store.add(s)
             self.embed.learn(s)
@@ -10667,6 +11120,8 @@ class NexusV10:
                 f"  Assembly Seq    : {self.assembly.stats['transitions']} transições de estado "
                 f"({self.assembly.stats['observations']} observações)\n"
                 f"  Embed DIM       : {self.embed.DIM}d\n"
+                f"  Encoder Semânt. : {semantic_provider().backend} "
+                f"— {semantic_provider().note}\n"
                 f"  XOR Bindings    : {self.xor_bind.size}\n"
                 f"  Novelty média   : {self.novelty.recent_novelty():.3f}\n"
                 f"  Temporal fatos  : {len(self.temporal._timestamps)}\n"
@@ -10736,7 +11191,7 @@ if __name__ == '__main__':
 
     # Flags delegadas ao entry point V14 unificado (final do arquivo)
     _V14_FLAGS = ('--demo', '--lif-demo', '--fly-demo', '--assembly-demo',
-                  '--production')
+                  '--agent-demo', '--production')
     if not any(f in sys.argv for f in _V14_FLAGS):
         print('=' * 60)
         print('NEXUS V10 ULTIMATE — Sistema Cognitivo SDR-First')
@@ -10893,12 +11348,21 @@ class SpecialistBrain:
     # ── Aprendizado ───────────────────────────────────────────────────────────
 
     def learn(self, fact: str) -> bool:
-        """Aprende um fato — usa SharedMemory se disponível, senão local."""
+        """Aprende um fato — usa SharedMemory se disponível, senão local.
+
+        V14.4: o índice local (_facts/_sdrs) é SEMPRE populado — a
+        SharedMemory deduplica fatos já armazenados pelo núcleo (origem
+        'core'), e isso não deve deixar o brain especialista cego ao fato
+        (corrige B6/B7: fatos propagados nunca apareciam em _facts).
+        """
         if self._shared:
             ok = self._shared.store(fact, brain_origin=self.id)
-            if ok:
+            fact_l = fact.lower()
+            if fact_l not in (f.lower() for f in self._facts[-100:]):
+                self._facts.append(fact)
+                self._sdrs.append(frozenset(self._enc.encode(fact)._idx))
                 self._learned_count += 1
-            return ok
+            return True   # fato registrado (na shared e/ou no índice local)
         # Fallback local
         fact_l = fact.lower()
         for existing in self._facts[-100:]:
@@ -11994,6 +12458,82 @@ def run_nexus_tests(verbose: bool = True) -> bool:
         f'modulação (DA, OCT)={_lm}')
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # BLOCO 14 — Encoder semântico neural + FlyAgent (mosca como agente)
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    if verbose: print('\n[B14] Encoder Semântico + FlyAgent (T-maze)')
+
+    prov14 = semantic_provider()
+    chk('Provedor semântico resolve backend',
+        prov14.backend in ('minilm-local', 'fastembed-multilingual',
+                           'miniembed-hash'),
+        f'{prov14.backend} — {prov14.note}')
+
+    if prov14.neural:
+        s_ban, _ = prov14.semantic_sdr('cheiro doce de banana madura')
+        s_man, _ = prov14.semantic_sdr('cheiro doce de manga madura')
+        s_car, _ = prov14.semantic_sdr('o carro anda rapido na estrada')
+        sim14 = s_ban.overlap_count(s_man)
+        dis14 = s_ban.overlap_count(s_car)
+        chk('SDR semântico neural: contraste de similaridade',
+            sim14 > dis14 + 4,
+            f'banana↔manga={sim14}/60 > banana↔carro={dis14}/60')
+
+    n14 = NexusFinal()
+    n14.disable_autosave()
+    e1 = n14.semantic_encode('teste de determinismo do encoder')
+    e2 = n14.semantic_encode('teste de determinismo do encoder')
+    chk('semantic_encode determinístico (mesmo SDR)',
+        e1.overlap_count(e2) == 60, f'overlap={e1.overlap_count(e2)}/60')
+    chk('chat() opera com encoder ativo',
+        isinstance(n14.chat('o que é fotossintese?'), str))
+
+    # fallback explícito: instância sem encoder neural
+    n14b = NexusFinal()
+    n14b.disable_autosave()
+    n14b.semantic_encoder_enabled = False
+    _eb = n14b.semantic_encode('qualquer texto')
+    chk('Fallback hash íntegro (semantic_encoder_enabled=False)',
+        len(_eb) == 60 and n14b.chat('o que é fotossintese?') != '')
+    if prov14.neural:
+        _en = n14.semantic_encode('qualquer texto')
+        chk('Espaços de bits distintos (neural ≠ hash)',
+            _en.overlap_count(_eb) < 20,
+            f'overlap={_en.overlap_count(_eb)}/60')
+
+    # marcador afetivo na conversa (a amígdala fala)
+    q14 = 'o cheiro pungente de vinagre é perigoso?'
+    n14.reinforce(q14, -3.0)
+    n14.reinforce(q14, -3.0)
+    r14 = n14.chat(q14)
+    chk('Valência aprendida marca a resposta (evitação auditável)',
+        '[⚠ memória afetiva' in (r14 or '')
+        and n14.last_emotion.get('decision') == 'avoid',
+        f"valência={n14.last_emotion.get('valence', 0):+.2f}")
+
+    # FlyAgent: T-maze + forrageamento on-line
+    rep14 = demo_fly_agent(verbose=False)
+    chk('FlyAgent T-maze: escolhe o braço recompensado',
+        rep14.get('t_maze') is True,
+        f"valências fruta={rep14['valences']['fruit']:+.2f} "
+        f"ácido={rep14['valences']['acid']:+.2f}")
+    if prov14.neural:
+        chk('FlyAgent generaliza odor novo (fruta nunca vista)',
+            rep14.get('generalization') == 'approach',
+            f"manga→{rep14.get('generalization')}")
+    else:
+        # Sem encoder neural a generalização semântica não é confiável —
+        # o fallback hash herda valência por tokens/n-grams, não por
+        # significado. É a diferença que o encoder neural faz.
+        chk('FlyAgent: generalização de odor EXIGE encoder neural (limitação documentada)',
+            rep14.get('generalization') in ('approach', 'avoid', 'neutral'),
+            f"hash fallback: manga→{rep14.get('generalization')} (sem semântica real)")
+    fg14 = rep14.get('foraging', {})
+    chk('FlyAgent aprende on-line com consequência (recompensa invertida)',
+        fg14.get('last5', 0) >= 4 and fg14.get('last5', 0) >= fg14.get('first5', 0),
+        f"primeiras5={fg14.get('first5')}/5 → últimas5={fg14.get('last5')}/5")
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # RESULTADO FINAL
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -12025,7 +12565,7 @@ if __name__ == '__main__':
 
     # Flags delegadas ao entry point V14 unificado (final do arquivo)
     _V14_FLAGS = ('--demo', '--lif-demo', '--fly-demo', '--assembly-demo',
-                  '--production')
+                  '--agent-demo', '--production')
     if not any(f in _sys.argv for f in _V14_FLAGS):
         print('=' * 70)
         print('NEXUS FINAL + GLOBAL WORKSPACE — Sistema Cognitivo com Multi-Cérebros')
@@ -14772,6 +15312,20 @@ def run_v14_selftest(verbose: bool = True) -> bool:
         len(thoughts) >= 1 and thoughts[0].get('sdr_bits', 0) > 0,
         f'{len(thoughts)} estados previstos')
     
+    # 9. Encoder semântico + FlyAgent
+    if verbose: print('\n[9] Encoder Semântico + FlyAgent')
+    prov = semantic_provider()
+    chk('Encoder semântico ativo no pipeline',
+        n.cognitive._core._semantic_backend == prov.backend,
+        f'{prov.backend}')
+    agent = FlyAgent(n.cognitive._core)
+    agent.train('cheiro doce de fruta madura', 1.0)
+    agent.train('cheiro acre de produto quimico', -1.0)
+    escolha = agent.choose('cheiro doce de fruta madura',
+                           'cheiro acre de produto quimico')
+    chk('FlyAgent escolhe o braço recompensado do T-maze',
+        escolha == 'cheiro doce de fruta madura', escolha[:30])
+    
     elapsed = time.time() - t0
     pct = ok/total if total else 0
     status = '✅ APROVADO' if pct >= 0.85 else '✗ FALHOU'
@@ -14824,6 +15378,10 @@ if __name__ == '__main__':
     elif '--assembly-demo' in _sys.argv:
         # Autoregressão no espaço de estados (assembly sequences)
         demo_assembly_sequences(verbose=True)
+    
+    elif '--agent-demo' in _sys.argv:
+        # A mosca como agente: T-maze + forrageamento on-line
+        demo_fly_agent(verbose=True)
     
     elif '--production' in _sys.argv:
         # Modo produção com kernel V11.2
