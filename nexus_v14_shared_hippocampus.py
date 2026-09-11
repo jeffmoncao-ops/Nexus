@@ -8443,6 +8443,9 @@ class NexusV10:
         self.semantic_encoder_enabled = True
         self._semantic_backend = 'miniembed-hash'
         self.last_emotion: Optional[Dict] = None   # valência do último turno
+        # V14.5: estímulos reforçados (texto, SDR) — fonte auditável da
+        # generalização do corpo cogumelar nas respostas
+        self._reinforced: List[Tuple[str, 'SparseSDR']] = []
         # BeamGenerator: geração com beam search + reranking
         self.beam_gen = BeamGenerator(self.ngram, self.embed)
         # AttentionPool: IDF-weighted sentence vectors
@@ -8836,6 +8839,10 @@ class NexusV10:
         # recentemente percorrida — transições marcadas com valor passam a
         # enviesar a predição do próximo estado (mosca × predição somados)
         marked = self.assembly.consolidate(reward)
+        # V14.5: registra o estímulo reforçado para generalização auditável
+        self._reinforced.append((text[:80], sdr))
+        if len(self._reinforced) > 256:
+            del self._reinforced[:len(self._reinforced) - 256]
         return {
             'text': text[:60],
             'reward': reward,
@@ -8843,6 +8850,66 @@ class NexusV10:
             'trajectories_marked': marked,
             **self.mushroom_body.readout(sdr),
         }
+
+    def fly_associations(self, text: str, k: int = 2,
+                         min_sim: float = 0.05) -> List[Dict]:
+        """V14.5: generalização do corpo cogumelar para um texto qualquer.
+
+        Ranking dos estímulos reforçados pelo fly-hash (códigos KC —
+        Dasgupta 2017): temas que compartilham KCs ativos com estímulos
+        treinados herdam a leitura associativa da mosca. É a mosca
+        participando da GENERALIZAÇÃO — com fonte auditável.
+        """
+        if not self._reinforced:
+            return []
+        # Candidatos: o texto completo E a versão só com palavras de
+        # conteúdo. Motivo medido: no encoder, perguntas em PT divergem
+        # do enunciado ("o que você acha do X?" ↔ X = 1/60 bits) — a
+        # associação deve focar no TÓPICO, não no andaime da pergunta.
+        cands = [text]
+        # andaime conversacional PT (o encoder diverge em perguntas:
+        # "o que você acha do X?" ↔ X medido em 1/60 bits — o TÓPICO
+        # é o que deve associar, não a moldura da pergunta)
+        scaffold = frozenset({
+            'voce', 'acha', 'achas', 'acho', 'fale', 'falar', 'diga',
+            'dizer', 'sabe', 'saber', 'sobre', 'qual', 'quais', 'como',
+            'quando', 'onde', 'porque', 'gosta', 'gostas', 'pensa'})
+        content = ' '.join(w for w in _tokenize_embed(text)
+                           if w not in self._CTX_NOISE and w not in scaffold)
+        if content and content != text.lower():
+            cands.append(content)
+        best: Dict[str, Dict] = {}
+        for cand in cands:
+            q = self.semantic_encode(cand)
+            for rtext, rsdr in self._reinforced:
+                # Score combinado — MÁX de TRÊS vistas de similaridade:
+                #   1. fly-hash KC (o circuito da mosca);
+                #   2. overlap semântico do SDR (o encoder);
+                #   3. Jaccard lexical de palavras de conteúdo.
+                # Cada vista sozinha falha num caso: o fly-hash infla em
+                # textos curtos (carro 0.09 vs manga 0.075 medido), o
+                # encoder inglês diverge em perguntas PT (1/60 bits), o
+                # léxico não generaliza sinonímia — a união cobre todas.
+                sim = max(self.mushroom_body.similarity(q, rsdr),
+                          q.overlap_count(rsdr) / SDR_ACTIVE)
+                toks_q = set(_tokenize_embed(cand))
+                toks_r = set(_tokenize_embed(rtext))
+                if toks_q and toks_r:
+                    sim = max(sim,
+                              len(toks_q & toks_r) / len(toks_q | toks_r))
+                if sim < min_sim:
+                    continue
+                cur = best.get(rtext)
+                if cur is None or sim > cur['similarity']:
+                    best[rtext] = {
+                        'stimulus': rtext,
+                        'similarity': round(sim, 3),
+                        'valence': round(self.mushroom_body.readout(rsdr)
+                                         .get('valence', 0.0), 2),
+                    }
+        scored = sorted(best.values(),
+                        key=lambda a: (-a['similarity'], a['stimulus']))
+        return scored[:k]
 
     def imagine(self, seed_text: str, steps: int = 3) -> List[Dict]:
         """Corrente de pensamento: rola a predição de estados a partir de um texto.
@@ -9015,14 +9082,19 @@ class NexusV10:
             response = cached  # resposta pré-computada válida
         else:
             response = self._route(text, sdr)
-            # V14.4: a amígdala fala na conversa — a valência aprendida do
-            # corpo cogumelar acompanha a resposta (lacuna fechada: antes o
-            # circuito da mosca não influenciava nada no diálogo)
-            _mb_turn = self.mushroom_body.readout(sdr)
-            self.last_emotion = {
-                'valence': _mb_turn.get('valence', 0.0),
-                'decision': _mb_turn.get('decision', 'neutral'),
-            }
+        # V14.4: a amígdala fala na conversa — a valência aprendida do
+        # corpo cogumelar acompanha a resposta (em qualquer caminho:
+        # roteado ou pré-computado no cache preditivo)
+        _mb_turn = self.mushroom_body.readout(sdr)
+        self.last_emotion = {
+            'valence': _mb_turn.get('valence', 0.0),
+            'decision': _mb_turn.get('decision', 'neutral'),
+        }
+        # V14.5: a mosca generaliza na resposta — associação mais forte
+        # com estímulos reforçados (fly-hash), exposta na emoção
+        _fly_assoc = self.fly_associations(text, k=1)
+        if _fly_assoc:
+            self.last_emotion['associated'] = _fly_assoc[0]
         
         # V10: Publica no RepresentationalBus
         self.rep_bus.publish(RepMessage(
@@ -9046,20 +9118,33 @@ class NexusV10:
         return self._emotion_marker(response)
 
     def _emotion_marker(self, response: str) -> str:
-        """V14.4: marca a resposta com o estado afetivo aprendido.
+        """V14.5: a mosca fala na conversa — valência, fonte e generalização.
 
         Valência fortemente negativa → nota de evitação condicionada;
-        fortemente positiva → nota de atração. É o corpo cogumelar da
-        Drosophila interferindo (de forma auditável) na conversa.
+        fortemente positiva → nota de atração; moderada com associação
+        forte → nota de GENERALIZAÇÃO do corpo cogumelar (o tema lembra
+        um estímulo reforçado — herança de valência por KCs
+        compartilhados, com a fonte auditável na própria resposta).
         """
         if not response or not self.last_emotion:
             return response
         dec = self.last_emotion.get('decision')
         val = self.last_emotion.get('valence', 0.0)
+        assoc = self.last_emotion.get('associated') or {}
+        src = ''
+        if assoc.get('stimulus'):
+            src = f", parecido com {assoc['stimulus'][:48]!r}"
         if dec == 'avoid' and val < -1.0:
-            return response + '\n[⚠ memória afetiva: evitação condicionada a este tema]'
+            return response + f'\n[⚠ memória afetiva: evitação condicionada a este tema{src}]'
         if dec == 'approach' and val > 1.5:
-            return response + '\n[♥ memória afetiva: atração condicionada a este tema]'
+            return response + f'\n[♥ memória afetiva: atração condicionada a este tema{src}]'
+        if (assoc.get('similarity', 0.0) >= 0.15
+                and abs(assoc.get('valence', 0.0)) >= 0.5
+                and assoc.get('stimulus')):
+            return response + (f"\n[corpo cogumelar: este tema lembra "
+                               f"{assoc['stimulus'][:48]!r} "
+                               f"(similaridade {assoc['similarity']:.2f}, "
+                               f"valência {assoc['valence']:+.2f})]")
         return response
 
     def learn(self, fact: str) -> str:
@@ -9423,6 +9508,10 @@ class NexusV10:
                 # salvas com outro backend têm espaço de bits incompatível)
                 'semantic_backend': getattr(self, '_semantic_backend',
                                             'miniembed-hash'),
+                # V14.5: estímulos reforçados (fonte da generalização)
+                'reinforced_registry': [
+                    {'text': t, 'bits': s.to_list()}
+                    for t, s in getattr(self, '_reinforced', [])[-256:]],
             }
             dir_ = os.path.dirname(os.path.abspath(filepath))
             # Cria o temporário no mesmo sistema de arquivos para garantir
@@ -9449,6 +9538,11 @@ class NexusV10:
             data = json.load(f)
         n = cls.__new__(cls)
         n._verbose      = verbose
+        # V14.4/V14.5: atributos novos (snapshots legados não os têm)
+        n.semantic_encoder_enabled = True
+        n._semantic_backend = data.get('semantic_backend', 'miniembed-hash')
+        n.last_emotion = None
+        n._reinforced = []
         n.encoder       = MultiLobeEncoder.from_dict(data.get('encoder', {}))
         n.embed         = MiniEmbed.from_dict(data.get('embed', {}))
         n.brain         = CognitiveBrain.from_dict(data.get('brain', {}))
@@ -9507,6 +9601,10 @@ class NexusV10:
         n.assembly = (AssemblySequencer.from_dict(asm_data)
                       if asm_data else AssemblySequencer())
         n._last_sdr = None   # a janela de diálogo reinicia a cada sessão
+        # V14.5: estímulos reforçados
+        n._reinforced = [
+            (r.get('text', ''), SparseSDR.from_indices(r.get('bits', [])))
+            for r in data.get('reinforced_registry', [])]
         def _auto_promote(belief: Belief, brain: CognitiveBrain) -> None:
             brain.store(belief.sdr, belief.text, tag='FACT',
                         confidence=belief.confidence)
@@ -10828,6 +10926,13 @@ class NexusV10:
         """Carrega estado salvo em disco sem resetar _dialog_ctx nem re-registrar atexit."""
         with open(filepath, 'r', encoding='utf-8') as f:
             data = json.load(f)
+        # V14.4/V14.5: defaults de atributos novos (a instância pode ter
+        # sido criada sem __init__ — ex.: NexusV10.load via __new__)
+        if not hasattr(self, 'semantic_encoder_enabled'):
+            self.semantic_encoder_enabled = True
+            self._semantic_backend = 'miniembed-hash'
+            self.last_emotion = None
+            self._reinforced = []
         # Restaura cada sub-sistema via from_dict
         if 'encoder' in data:
             self.encoder = MultiLobeEncoder.from_dict(data['encoder'])
@@ -10889,6 +10994,10 @@ class NexusV10:
         if asm_data:
             self.assembly = AssemblySequencer.from_dict(asm_data)
         self._last_sdr = None
+        # V14.5: estímulos reforçados
+        self._reinforced = [
+            (r.get('text', ''), SparseSDR.from_indices(r.get('bits', [])))
+            for r in data.get('reinforced_registry', [])]
         # rev.8: ContextEngine
         dim = self.embed.DIM
         self._ctx_topic_vec = data.get('ctx_topic_vec', [0.0]*dim)
@@ -12532,6 +12641,37 @@ def run_nexus_tests(verbose: bool = True) -> bool:
     chk('FlyAgent aprende on-line com consequência (recompensa invertida)',
         fg14.get('last5', 0) >= 4 and fg14.get('last5', 0) >= fg14.get('first5', 0),
         f"primeiras5={fg14.get('first5')}/5 → últimas5={fg14.get('last5')}/5")
+
+    # V14.5: a mosca na generalização das RESPOSTAS (conversa limpa)
+    n14c = NexusFinal()
+    n14c.disable_autosave()
+    n14c.reinforce('cheiro doce de banana madura', 1.0)
+    n14c.reinforce('cheiro doce de banana madura', 1.0)
+    assoc14 = n14c.fly_associations(
+        'o que você acha do cheiro doce de manga madura?', k=1)
+    chk('fly_associations(): generaliza para estímulo nunca reforçado',
+        len(assoc14) >= 1 and 'banana' in assoc14[0]['stimulus']
+        and assoc14[0]['similarity'] >= 0.3,
+        f"manga→{assoc14[0]['stimulus'][:28]!r} sim={assoc14[0]['similarity']}"
+        if assoc14 else 'nenhuma')
+    r14c = n14c.chat('o que você acha do cheiro doce de manga madura?')
+    chk('A mosca participa da generalização da RESPOSTA (nota auditável)',
+        ('corpo cogumelar' in (r14c or '')) and ('banana' in (r14c or '')),
+        ((r14c or '').splitlines()[-1][:56]) if r14c else '')
+    _assoc_le = n14c.last_emotion.get('associated') or {}
+    chk('Fonte da associação exposta na emoção do turno',
+        _assoc_le.get('stimulus', '').startswith('cheiro doce de banana'),
+        f"sim={_assoc_le.get('similarity')}")
+    n14c.save('/tmp/nx_v145.json')
+    m14c = NexusV10.load('/tmp/nx_v145.json')
+    assoc_rt = m14c.fly_associations('cheiro doce de manga madura', k=1)
+    chk('Registro de estímulos reforçados sobrevive ao round-trip',
+        len(assoc_rt) >= 1 and 'banana' in assoc_rt[0]['stimulus'],
+        f"{len(m14c._reinforced)} estímulos restaurados")
+    try:
+        os.unlink('/tmp/nx_v145.json')
+    except OSError:
+        pass
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # RESULTADO FINAL
@@ -15325,6 +15465,11 @@ def run_v14_selftest(verbose: bool = True) -> bool:
                            'cheiro acre de produto quimico')
     chk('FlyAgent escolhe o braço recompensado do T-maze',
         escolha == 'cheiro doce de fruta madura', escolha[:30])
+    assoc9 = n.cognitive._core.fly_associations(
+        'cheiro doce de manga madura', k=1)
+    chk('Corpo cogumelar generaliza na resposta (fly_associations)',
+        len(assoc9) >= 1 and assoc9[0]['valence'] > 0,
+        f"manga→{assoc9[0]['stimulus'][:26]!r}" if assoc9 else 'nenhuma')
     
     elapsed = time.time() - t0
     pct = ok/total if total else 0
