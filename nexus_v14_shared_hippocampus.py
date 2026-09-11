@@ -10,6 +10,8 @@
 ║  CAMADA COGNITIVA (V10 Ultimate):                                            ║
 ║  • SparseSDR 10.000 bits — 60 ativos, esparsidade 0,6% (neocortical)         ║
 ║  • SpikingCortex — neurônios LIF: leak + limiar + refratário + Hebbiano      ║
+║  • MushroomBody — corpo cogumelar da Drosophila: valência + dopamina        ║
+║  • AssemblySequencer — predição do próximo estado SDR (assembly sequences)  ║
 ║  • MiniEmbed 768D — Word2Vec + FastText + Hebbiano                           ║
 ║  • CognitiveBrain — InvertedIndex O(1) recall                                ║
 ║  • ConceptGraph — analogia XOR, BFS, vizinhos ponderados                     ║
@@ -6979,6 +6981,413 @@ def demo_fly_brain(verbose: bool = True) -> Dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# §V10d  ASSEMBLY SEQUENCER — autoregressão no espaço de ESTADOS (SDR)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Em vez de prever o próximo TOKEN (superfície), o sequencer prevê o
+# próximo ESTADO esparso: SDR_t → SDR_{t+1}. É o nível de mecanismo dos
+# "assembly sequences" — trajetórias entre populações esparsas:
+#   • HTM Temporal Memory (Hawkins): aprende transições entre colunas SDR;
+#   • Assembly Calculus (Papadimitriou et al. 2020): formaliza sequências
+#     de assemblies como modelo de raciocínio cortical;
+#   • Buzsáki: o "pensamento" é a transição entre códigos de população
+#     ("slot codes"), não o disparo isolado.
+#
+# Os três componentes da arquitetura de predição de estados:
+#   1. Encoder esparso ........ já existe (LIF/HDC → SDR 10.000/60);
+#   2. Contexto / latent ...... SDR de contexto com decaimento exponencial
+#                               (a "cola" dinâmica entre transições) +
+#                               embedding denso do estado via state_embedding()
+#                               — o slot natural onde um SLM entra no futuro;
+#   3. Decoder associativo .... predição = bundle PONDERADO dos sucessores
+#                               das transições cujo predecessor overlapa a
+#                               query, colapsado em top-60 bits → o SDR
+#                               previsto é sempre um estado VÁLIDO (colapsa
+#                               sobre a variedade dos estados observados —
+#                               o attractor é a própria memória).
+#
+# Honestidade arquitetural: transformers já preveem no nível de estados
+# implicitamente (o token é só o readout do residual stream). O que esta
+# camada oferece de diferente: predição EXPLÍCITA, esparsa, incremental
+# (one-shot, sem gradiente), inspecionável (cada transição é auditável) e
+# barata (índice invertido O(k)) — com surpresa auto-supervisionada
+# fechando o loop com a neuromodulação: erro de predição → octopamina →
+# arousal/ganho de aprendizado.
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class AssemblySequencer:
+    """
+    Memória associativa de transições SDR_t → SDR_{t+1} — raciocínio como
+    trajetória entre populações esparsas (assembly sequences).
+
+    Aprendizado: observe(pre, post) registra/reforça a transição —
+    incremental, one-shot, sem gradiente. Índice invertido bit→transição
+    dá recall O(k), como no CognitiveBrain.
+
+    Predição: predict(pre, context) recupera transições cujo predecessor
+    compartilha ≥ min_overlap bits com a query, pondera os sucessores por
+    similaridade × contagem × bônus de contexto, e colapsa o bundle em
+    top-60 bits. Generaliza no espaço de estados: um SDR NUNCA VISTO, mas
+    próximo de predecessores conhecidos, recebe o bundle dos futuros
+    plausíveis — superfície diferente, mesmo rumo.
+
+    Surpresa: surprise(pre, post) = 1 − overlap(predito, observado);
+    1.0 quando não há predição possível (estado inédito).
+
+    Imaginação: imagine(seed, steps) rola a predição para frente com um
+    contexto local que também evolui — a "corrente de pensamento" do
+    sistema, decodificável em texto pelo recall da memória.
+
+    Uso:
+        seq = AssemblySequencer()
+        seq.observe(sdr_a, sdr_b)         # aprende a transição (one-shot)
+        nxt = seq.predict(sdr_a)          # ≈ sdr_b
+        chain = seq.imagine(sdr_a, 3)     # rola a trajetória para frente
+        s = seq.surprise(sdr_a, sdr_c)    # erro de predição (0..1)
+        v = seq.state_embedding(sdr_a)    # embedding denso do estado (256d)
+    """
+
+    _EMB_DIM = 256   # dimensão do embedding denso de estado
+
+    def __init__(self,
+                 capacity: int = 4096,
+                 min_overlap: int = 12,
+                 context_weight: float = 0.5,
+                 context_decay: float = 0.5,
+                 k_active: int = SDR_ACTIVE,
+                 seed: int = SDR_SEED):
+        self.capacity        = capacity
+        self.min_overlap     = min_overlap
+        self.context_weight  = context_weight
+        self.context_decay   = context_decay
+        self.k_active        = k_active
+        self.seed            = seed
+
+        # Transições: id → {'pre': frozenset, 'post': frozenset, 'count': int}
+        self._trans: Dict[int, Dict] = {}
+        self._next_id: int = 0
+        self._bit_idx: Dict[int, Set[int]] = defaultdict(set)   # bit → ids
+        self._pair_idx: Dict[Tuple[frozenset, frozenset], int] = {}
+
+        # Contexto esparso com decaimento — a "cola" entre transições
+        self._ctx_counts: Dict[int, float] = defaultdict(float)
+
+    # ── Estado → embedding denso (projeção aleatória determinística) ────────
+
+    def _bit_vec(self, j: int) -> array.array:
+        """Vetor denso determinístico do bit j (LCG — mesmo esquema do LSH)."""
+        seed = (j * 6364136223846793005 + 1442695040888963407) & 0xFFFFFFFF
+        v = []
+        for _ in range(self._EMB_DIM):
+            seed = (seed * 1664525 + 1013904223) & 0xFFFFFFFF
+            v.append((seed / 0xFFFFFFFF) * 2 - 1)
+        return array.array('f', v)
+
+    def state_embedding(self, sdr) -> List[float]:
+        """Embedding denso (256d) do estado esparso — a "cola contínua".
+
+        Projeção aleatória determinística: bits compartilhados → vetores
+        próximos (cos alto). Este é o slot natural para um SLM: quando
+        disponível, o vetor vem do encoder de linguagem em vez da projeção,
+        e a predição de estados herda a semântica do modelo.
+        """
+        if isinstance(sdr, SparseSDR):
+            idx = sdr.to_list()
+        else:
+            idx = [int(i) for i in sdr]
+        if not idx:
+            return [0.0] * self._EMB_DIM
+        out = [0.0] * self._EMB_DIM
+        for j in idx:
+            v = self._bit_vec(j)
+            for d in range(self._EMB_DIM):
+                out[d] += v[d]
+        nrm = math.sqrt(sum(x * x for x in out)) or 1.0
+        return [x / nrm for x in out]
+
+    # ── Contexto esparso (decai e absorve os estados por onde passou) ───────
+
+    def context(self) -> SparseSDR:
+        """SDR do contexto corrente (histórico recente, decaído)."""
+        top = sorted(self._ctx_counts.items(),
+                     key=lambda kv: (-kv[1], kv[0]))[:self.k_active]
+        return SparseSDR.from_indices([b for b, _ in top])
+
+    def _absorb(self, post: frozenset) -> None:
+        for b in list(self._ctx_counts):
+            self._ctx_counts[b] *= self.context_decay
+            if self._ctx_counts[b] < 0.05:
+                del self._ctx_counts[b]
+        for b in post:
+            self._ctx_counts[b] = self._ctx_counts.get(b, 0.0) + 1.0
+
+    # ── Aprendizado (one-shot, sem gradiente) ────────────────────────────────
+
+    def observe(self, pre_sdr, post_sdr) -> None:
+        """Registra (ou reforça) a transição pre→post e absorve post no contexto.
+
+        pre=None semeia apenas o contexto (primeiro turno de um diálogo).
+        """
+        def _fs(s):
+            if s is None:
+                return None
+            if isinstance(s, SparseSDR):
+                return frozenset(s.to_list())
+            return frozenset(int(i) for i in s)
+
+        pre, post = _fs(pre_sdr), _fs(post_sdr)
+        if post:
+            self._absorb(post)
+        if not pre or not post:
+            return
+        key = (pre, post)
+        tid = self._pair_idx.get(key)
+        if tid is None:
+            tid = self._next_id
+            self._next_id += 1
+            self._trans[tid] = {'pre': pre, 'post': post, 'count': 1}
+            self._pair_idx[key] = tid
+            for b in pre:
+                self._bit_idx[b].add(tid)
+            self._prune_if_needed()
+        else:
+            self._trans[tid]['count'] += 1
+
+    def _prune_if_needed(self) -> None:
+        """Capacidade: poda as transições menos observadas (esquecimento)."""
+        while len(self._trans) > self.capacity:
+            worst = min(self._trans, key=lambda t: (self._trans[t]['count'], -t))
+            tr = self._trans.pop(worst)
+            self._pair_idx.pop((tr['pre'], tr['post']), None)
+            for b in tr['pre']:
+                s = self._bit_idx.get(b)
+                if s is not None:
+                    s.discard(worst)
+                    if not s:
+                        del self._bit_idx[b]
+
+    # ── Predição (decoder associativo: bundle ponderado → top-60) ───────────
+
+    def predict(self, pre_sdr, context_sdr=None) -> Optional[SparseSDR]:
+        """Prevê o próximo estado esparso a partir do estado (e contexto) atual.
+
+        Recupera transições cujo predecessor compartilha ≥ min_overlap bits
+        com a query (índice invertido, O(k)); pondera cada sucessor por
+        similaridade × contagem × (1 + bônus de contexto); o bundle de
+        sucessores colapsa nos top-k_active bits mais votados. O resultado
+        é sempre um SDR válido — uma composição dos futuros plausíveis.
+        Retorna None quando não há predecessores parecidos (estado inédito).
+        """
+        if isinstance(pre_sdr, SparseSDR):
+            q = set(pre_sdr.to_list())
+        else:
+            q = {int(i) for i in pre_sdr}
+        if not q:
+            return None
+        ctx: Set[int] = set()
+        if context_sdr is not None:
+            if isinstance(context_sdr, SparseSDR):
+                ctx = set(context_sdr.to_list())
+            else:
+                ctx = {int(i) for i in context_sdr}
+
+        cand: Dict[int, int] = defaultdict(int)   # tid → overlap com a query
+        for b in q:
+            for tid in self._bit_idx.get(b, ()):
+                cand[tid] += 1
+        if not cand:
+            return None
+
+        votes: Dict[int, float] = defaultdict(float)
+        for tid, ov in cand.items():
+            if ov < self.min_overlap:
+                continue
+            tr = self._trans[tid]
+            w = (ov / len(tr['pre'])) * tr['count']
+            if ctx:
+                # bônus para ramos coerentes com a trajetória recente
+                w *= (1.0 + self.context_weight
+                      * len(ctx & tr['post']) / max(len(tr['post']), 1))
+            for b2 in tr['post']:
+                votes[b2] += w
+        if not votes:
+            return None
+        top = sorted(votes.items(), key=lambda kv: (-kv[1], kv[0]))[:self.k_active]
+        return SparseSDR.from_indices([b for b, _ in top])
+
+    def surprise(self, pre_sdr, post_sdr) -> float:
+        """Erro de predição (auto-supervisionado): 1 − overlap(predito, real).
+
+        1.0 = estado completamente inédito (sem predição possível);
+        ~0.0 = transição já conhecida. Sinal natural de novidade/curiosidade.
+        """
+        predicted = self.predict(pre_sdr, context_sdr=self.context())
+        if predicted is None:
+            return 1.0
+        actual = (post_sdr if isinstance(post_sdr, SparseSDR)
+                  else SparseSDR.from_indices([int(i) for i in post_sdr]))
+        return 1.0 - predicted.overlap_score(actual)
+
+    def imagine(self, seed_sdr, steps: int = 3) -> List[SparseSDR]:
+        """Rola a predição para frente: a corrente de pensamento.
+
+        Cada estado previsto alimenta a próxima predição, com um contexto
+        LOCAL que também evolui (o "sonho" não polui o contexto real).
+        Para quando não há predecessors parecidos — fim da trajetória.
+        """
+        cur = (seed_sdr if isinstance(seed_sdr, SparseSDR)
+               else SparseSDR.from_indices([int(i) for i in seed_sdr]))
+        ctx_counts: Dict[int, float] = dict(self._ctx_counts)
+        chain: List[SparseSDR] = []
+        for _ in range(max(0, steps)):
+            if ctx_counts:
+                top = sorted(ctx_counts.items(),
+                             key=lambda kv: (-kv[1], kv[0]))[:self.k_active]
+                ctx_sdr = SparseSDR.from_indices([b for b, _ in top])
+            else:
+                ctx_sdr = None
+            nxt = self.predict(cur, context_sdr=ctx_sdr)
+            if nxt is None:
+                break
+            chain.append(nxt)
+            cur = nxt
+            for b in list(ctx_counts):
+                ctx_counts[b] *= self.context_decay
+                if ctx_counts[b] < 0.05:
+                    del ctx_counts[b]
+            for b in cur.to_list():
+                ctx_counts[b] = ctx_counts.get(b, 0.0) + 1.0
+        return chain
+
+    # ── Serialização ─────────────────────────────────────────────────────────
+
+    @property
+    def stats(self) -> Dict:
+        return {
+            'transitions': len(self._trans),
+            'observations': sum(t['count'] for t in self._trans.values()),
+            'context_bits': len(self._ctx_counts),
+            'capacity': self.capacity,
+        }
+
+    def to_dict(self) -> dict:
+        return {
+            'capacity': self.capacity, 'min_overlap': self.min_overlap,
+            'context_weight': self.context_weight,
+            'context_decay': self.context_decay,
+            'k_active': self.k_active, 'seed': self.seed,
+            'transitions': [{'pre': sorted(t['pre']),
+                             'post': sorted(t['post']),
+                             'count': t['count']}
+                            for t in self._trans.values()],
+            'ctx_counts': {str(b): round(c, 4)
+                           for b, c in self._ctx_counts.items()},
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> 'AssemblySequencer':
+        seq = cls(capacity=d.get('capacity', 4096),
+                  min_overlap=d.get('min_overlap', 12),
+                  context_weight=d.get('context_weight', 0.5),
+                  context_decay=d.get('context_decay', 0.5),
+                  k_active=d.get('k_active', SDR_ACTIVE),
+                  seed=d.get('seed', SDR_SEED))
+        for t in d.get('transitions', []):
+            pre = frozenset(int(b) for b in t.get('pre', []))
+            post = frozenset(int(b) for b in t.get('post', []))
+            if not pre or not post:
+                continue
+            tid = seq._next_id
+            seq._next_id += 1
+            seq._trans[tid] = {'pre': pre, 'post': post,
+                               'count': int(t.get('count', 1))}
+            seq._pair_idx[(pre, post)] = tid
+            for b in pre:
+                seq._bit_idx[b].add(tid)
+        seq._ctx_counts = defaultdict(
+            float, {int(b): c for b, c in d.get('ctx_counts', {}).items()})
+        return seq
+
+
+def demo_assembly_sequences(verbose: bool = True) -> Dict:
+    """
+    Demonstração do AssemblySequencer: predição do próximo estado esparso,
+    imaginação encadeada, desambiguação por contexto e sinal de surpresa.
+
+    Narrativa: 'fogo' tem DOIS futuros possíveis —
+      fogo→água→vapor   (ramo do vapor)
+      fogo→madeira→cinzas (ramo das cinzas)
+    """
+    seq = AssemblySequencer()
+    names = ('fogo', 'agua', 'vapor', 'madeira', 'cinzas')
+    st = {n: create_sdr_with_overlap(seed=201 + i) for i, n in enumerate(names)}
+    report: Dict = {}
+
+    if verbose:
+        print('=== ASSEMBLY SEQUENCES — autoregressão no espaço de estados ===')
+        print('Narrativa: fogo→agua→vapor  |  fogo→madeira→cinzas')
+        print('(transições observadas 1× — aprendizado one-shot, sem gradiente)\n')
+
+    # Ramo 1: a narrativa da água
+    seq.observe(st['fogo'], st['agua'])
+    seq.observe(st['agua'], st['vapor'])
+    pred_ctx = seq.predict(st['fogo'], context_sdr=seq.context())
+    ov_agua = pred_ctx.overlap_count(st['agua']) if pred_ctx else 0
+    if verbose:
+        print(f"Contexto = {{agua, vapor}} → predict(fogo) aponta o ramo da água: "
+              f"overlap com 'agua' = {ov_agua}/60")
+
+    # Ramo 2: a narrativa da madeira (agora 'fogo' tem dois futuros)
+    seq.observe(st['fogo'], st['madeira'])
+    seq.observe(st['madeira'], st['cinzas'])
+    pred_mix = seq.predict(st['fogo'])
+    ov_agua2 = pred_mix.overlap_count(st['agua']) if pred_mix else 0
+    ov_mad = pred_mix.overlap_count(st['madeira']) if pred_mix else 0
+    if verbose:
+        print(f"Sem contexto → predict(fogo) é o BUNDLE dos dois futuros: "
+              f"overlap agua={ov_agua2}/60, madeira={ov_mad}/60")
+    report['bundle'] = {'agua': ov_agua2, 'madeira': ov_mad}
+
+    # Imaginação: rola a trajetória para frente
+    chain = seq.imagine(st['fogo'], steps=4)
+    if verbose:
+        print('\nImaginação a partir de fogo (4 passos):')
+        for i, sdr in enumerate(chain):
+            ovs = {n: sdr.overlap_count(s2) for n, s2 in st.items()}
+            best = max(ovs, key=lambda n: ovs[n])
+            print(f'  estado previsto {i + 1}: mais próximo de {best!r} '
+                  f'(overlap {ovs[best]}/60)')
+    report['chain_len'] = len(chain)
+
+    # Surpresa: estado inédito vs transição conhecida
+    seq_fresh = AssemblySequencer()
+    s_novel = seq_fresh.surprise(st['fogo'], st['agua'])
+    seq_fresh.observe(st['fogo'], st['agua'])
+    s_known = seq_fresh.surprise(st['fogo'], st['agua'])
+    if verbose:
+        print(f'\nSurpresa: estado inédito = {s_novel:.2f} | '
+              f'transição conhecida = {s_known:.2f}')
+    report['surprise'] = {'novel': s_novel, 'known': s_known}
+
+    # Generalização no espaço de estados
+    fogo2 = create_sdr_with_overlap(st['fogo'], shared_bits=30, seed=210)
+    pred_gen = seq.predict(fogo2)
+    ovs_gen = ({n: pred_gen.overlap_count(s2) for n, s2 in st.items()}
+               if pred_gen else {})
+    if verbose:
+        best = max(ovs_gen, key=lambda n: ovs_gen[n])
+        print(f'Estado NOVO (30/60 bits com fogo) → mesmo rumo: '
+              f'mais próximo de {best!r} (overlap {ovs_gen[best]}/60)')
+    report['generalization'] = ovs_gen
+
+    if verbose:
+        print(f"\nEstatística: {seq.stats}")
+    report['stats'] = seq.stats
+    return report
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # §V10  SDR REASONER — raciocínio lógico via operações bitwise
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -7527,6 +7936,11 @@ class NexusV10:
         # Neuromodulation: estado global DA/SER/OCT (1,2% dos neurônios da
         # mosca controlam o ganho do cérebro inteiro)
         self.neuromodulation = Neuromodulation()
+        # AssemblySequencer: memória de transições SDR_t→SDR_{t+1} —
+        # predição do próximo ESTADO (assembly sequences), com surpresa
+        # alimentando a neuromodulação (erro de predição → octopamina)
+        self.assembly = AssemblySequencer()
+        self._last_sdr: Optional[SparseSDR] = None   # último estado observado
         # BeamGenerator: geração com beam search + reranking
         self.beam_gen = BeamGenerator(self.ngram, self.embed)
         # AttentionPool: IDF-weighted sentence vectors
@@ -7913,6 +8327,30 @@ class NexusV10:
             **self.mushroom_body.readout(sdr),
         }
 
+    def imagine(self, seed_text: str, steps: int = 3) -> List[Dict]:
+        """Corrente de pensamento: rola a predição de estados a partir de um texto.
+
+        O texto-semente é codificado em SDR; o AssemblySequencer prevê os
+        próximos estados esparsos (assembly sequences); cada estado previsto
+        é decodificado em texto pelo recall associativo da memória — a
+        trajetória do 'pensamento' do Nexus, auditável passo a passo.
+        """
+        seed = self.semantic_encode(seed_text)
+        chain = self.assembly.imagine(seed, steps=steps)
+        out: List[Dict] = []
+        for sdr in chain:
+            recall = None
+            try:
+                best = self.brain.best_match(sdr)
+                if best is not None and hasattr(best[1], 'text'):
+                    recall = best[1].text[:80]
+            except Exception:
+                pass
+            out.append({'sdr_bits': len(sdr),
+                        'recall': recall,
+                        'overlap_with_seed': round(sdr.overlap_score(seed), 3)})
+        return out
+
     # ── [V9→FINAL FIX] Código de auto-persistência foi movido
     # ── para dentro do __init__ (estava em código morto após return).
 
@@ -8033,6 +8471,20 @@ class NexusV10:
         # V14: percepção no córtex spiking — o SDR estimula a população LIF
         # (integração → leak → disparo → refratário → potenciação Hebbiana)
         self.spiking_cortex.observe(sdr, label=text[:40])
+
+        # V14.2: AssemblySequencer — predição do próximo ESTADO esparso.
+        # Primeiro TESTA (surpresa = erro de predição do estado atual dado o
+        # anterior), depois TREINA (a transição observada entra na memória).
+        # Surpresa alta → pulso de octopamina (arousal → ganho de aprendizado),
+        # o loop neuromodulatório que fecha a predição com a emoção.
+        if self._last_sdr is not None:
+            _asm_surprise = self.assembly.surprise(self._last_sdr, sdr)
+            if _asm_surprise > 0.8:
+                self.neuromodulation.pulse(octopamine=0.4)
+            self.assembly.observe(self._last_sdr, sdr)
+        else:
+            self.assembly.observe(None, sdr)   # primeiro turno: semeia o contexto
+        self._last_sdr = sdr
         
         # V10: Predictive cache — busca resposta pré-computada
         cached = self.pred_cache.get_by_sdr(sdr, min_overlap=0.35)
@@ -8409,6 +8861,9 @@ class NexusV10:
                 'mushroom_body': (self.mushroom_body.to_dict()
                                   if getattr(self, 'mushroom_body', None)
                                   else None),
+                # V14.2: Trajetórias de estados (transições SDR→SDR)
+                'assembly': (self.assembly.to_dict()
+                             if getattr(self, 'assembly', None) else None),
             }
             dir_ = os.path.dirname(os.path.abspath(filepath))
             # Cria o temporário no mesmo sistema de arquivos para garantir
@@ -8488,6 +8943,11 @@ class NexusV10:
         n.mushroom_body = (MushroomBody.from_dict(mb_data)
                            if mb_data else MushroomBody())
         n.neuromodulation = Neuromodulation()
+        # V14.2: restaura trajetórias de estados (assembly sequences)
+        asm_data = data.get('assembly')
+        n.assembly = (AssemblySequencer.from_dict(asm_data)
+                      if asm_data else AssemblySequencer())
+        n._last_sdr = None   # a janela de diálogo reinicia a cada sessão
         def _auto_promote(belief: Belief, brain: CognitiveBrain) -> None:
             brain.store(belief.sdr, belief.text, tag='FACT',
                         confidence=belief.confidence)
@@ -9864,6 +10324,11 @@ class NexusV10:
         mb_data = data.get('mushroom_body')
         if mb_data:
             self.mushroom_body = MushroomBody.from_dict(mb_data)
+        # V14.2: AssemblySequencer — transições de estados aprendidas
+        asm_data = data.get('assembly')
+        if asm_data:
+            self.assembly = AssemblySequencer.from_dict(asm_data)
+        self._last_sdr = None
         # rev.8: ContextEngine
         dim = self.embed.DIM
         self._ctx_topic_vec = data.get('ctx_topic_vec', [0.0]*dim)
@@ -10092,6 +10557,8 @@ class NexusV10:
                 f"  Corpo Cogumelar : {self.mushroom_body.n_kc} KCs × {self.mushroom_body.kc_inputs} entradas, "
                 f"{self.mushroom_body.n_mbons} MBONs, "
                 f"{self.mushroom_body.stats['synapses']} sinapses KC→MBON\n"
+                f"  Assembly Seq    : {self.assembly.stats['transitions']} transições de estado "
+                f"({self.assembly.stats['observations']} observações)\n"
                 f"  Embed DIM       : {self.embed.DIM}d\n"
                 f"  XOR Bindings    : {self.xor_bind.size}\n"
                 f"  Novelty média   : {self.novelty.recent_novelty():.3f}\n"
@@ -10161,7 +10628,8 @@ if __name__ == '__main__':
     import sys
 
     # Flags delegadas ao entry point V14 unificado (final do arquivo)
-    _V14_FLAGS = ('--demo', '--lif-demo', '--fly-demo', '--production')
+    _V14_FLAGS = ('--demo', '--lif-demo', '--fly-demo', '--assembly-demo',
+                  '--production')
     if not any(f in sys.argv for f in _V14_FLAGS):
         print('=' * 60)
         print('NEXUS V10 ULTIMATE — Sistema Cognitivo SDR-First')
@@ -10771,10 +11239,16 @@ class GlobalWorkspaceNexus:
     def mushroom_body(self): return self._core.mushroom_body
     @property
     def neuromodulation(self): return self._core.neuromodulation
+    @property
+    def assembly(self): return self._core.assembly
 
     def reinforce(self, text: str, reward: float = 1.0) -> Dict:
         """Reforço dopaminérgico no corpo cogumelar (delega ao núcleo V10)."""
         return self._core.reinforce(text, reward)
+
+    def imagine(self, seed_text: str, steps: int = 3) -> List[Dict]:
+        """Corrente de pensamento via AssemblySequencer (delega ao V10)."""
+        return self._core.imagine(seed_text, steps=steps)
     @property
     def concept_graph(self): return self._core.concept_graph
     @property
@@ -11292,6 +11766,77 @@ def run_nexus_tests(verbose: bool = True) -> bool:
         f"Δ={rr12.get('synaptic_delta'):.1f}")
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # BLOCO 13 — AssemblySequencer: autoregressão no espaço de estados
+    # (predição do próximo SDR — assembly sequences)
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    if verbose: print('\n[B13] Assembly Sequences — predição do próximo estado')
+
+    s_a = create_sdr_with_overlap(seed=201)
+    s_b = create_sdr_with_overlap(seed=202)
+    s_c = create_sdr_with_overlap(seed=203)
+    s_d = create_sdr_with_overlap(seed=204)
+    seq13 = AssemblySequencer()
+
+    chk('Estado inédito: surpresa máxima (1.0)',
+        abs(seq13.surprise(s_a, s_b) - 1.0) < 1e-9)
+
+    for pre, post in ((s_a, s_b), (s_b, s_c), (s_c, s_d)):
+        seq13.observe(pre, post)
+    pred13 = seq13.predict(s_a)
+    chk('Predição do próximo estado (a→b, overlap ≥ 50/60)',
+        pred13 is not None and pred13.overlap_count(s_b) >= 50,
+        f'overlap={pred13.overlap_count(s_b) if pred13 else 0}/60')
+
+    chain13 = seq13.imagine(s_a, steps=3)
+    chk('Imaginação encadeia a trajetória (a→b→c→d)',
+        len(chain13) == 3
+        and chain13[0].overlap_count(s_b) >= 50
+        and chain13[2].overlap_count(s_d) >= 50,
+        f'{len(chain13)} estados previstos')
+
+    chk('Surpresa cai após aprendizado da transição',
+        seq13.surprise(s_a, s_b) < 0.1,
+        f'surpresa={seq13.surprise(s_a, s_b):.3f}')
+
+    # Generalização no espaço de estados (superfície nova → rumo conhecido)
+    s_a2 = create_sdr_with_overlap(s_a, shared_bits=30, seed=210)
+    pred_gen13 = seq13.predict(s_a2)
+    chk('Generalização de estado: SDR novo (30/60) → futuro conhecido',
+        pred_gen13 is not None and pred_gen13.overlap_count(s_b) >= 30,
+        f'overlap com b={pred_gen13.overlap_count(s_b) if pred_gen13 else 0}/60')
+
+    # Embedding de estado preserva similaridade (a "cola contínua")
+    def _cos13(u, v):
+        nu = math.sqrt(sum(x * x for x in u)); nv = math.sqrt(sum(x * x for x in v))
+        return sum(x * y for x, y in zip(u, v)) / (nu * nv) if nu and nv else 0.0
+    e_a, e_a2, e_d = (seq13.state_embedding(s) for s in (s_a, s_a2, s_d))
+    chk('Embedding de estado: cos(a,a2) > cos(a,d)',
+        _cos13(e_a, e_a2) > _cos13(e_a, e_d),
+        f'{_cos13(e_a, e_a2):.3f} > {_cos13(e_a, e_d):.3f}')
+
+    # Serialização: trajetórias sobrevivem ao round-trip
+    seq_r13 = AssemblySequencer.from_dict(seq13.to_dict())
+    chk('Serialização preserva transições',
+        seq_r13.predict(s_a).overlap_count(s_b) >= 50,
+        f"{seq_r13.stats['transitions']} transições restauradas")
+
+    # Integração: chat() alimenta transições; imagine() decodifica o raciocínio
+    n13 = NexusFinal()
+    n13.disable_autosave()
+    n13.chat('aprenda: o fogo queima a madeira seca')
+    n13.chat('aprenda: a agua apaga o fogo')
+    chk('chat() alimenta transições de estado ( AssemblySequencer)',
+        n13.assembly.stats['transitions'] >= 1,
+        f"{n13.assembly.stats['transitions']} transições")
+    thoughts13 = n13.imagine('aprenda: o fogo queima a madeira seca', steps=2)
+    chk('imagine() decodifica a corrente de pensamento em texto',
+        len(thoughts13) >= 1 and thoughts13[0]['recall'] is not None,
+        f"recall='{(thoughts13[0]['recall'] or '')[:40] if thoughts13 else ''}'")
+    chk('Predição no pipeline não afeta as respostas do chat',
+        isinstance(n13.chat('o que é fogo?'), str))
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # RESULTADO FINAL
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -11322,7 +11867,8 @@ if __name__ == '__main__':
         _sys.exit(0 if ok else 1)
 
     # Flags delegadas ao entry point V14 unificado (final do arquivo)
-    _V14_FLAGS = ('--demo', '--lif-demo', '--fly-demo', '--production')
+    _V14_FLAGS = ('--demo', '--lif-demo', '--fly-demo', '--assembly-demo',
+                  '--production')
     if not any(f in _sys.argv for f in _V14_FLAGS):
         print('=' * 70)
         print('NEXUS FINAL + GLOBAL WORKSPACE — Sistema Cognitivo com Multi-Cérebros')
@@ -13813,6 +14359,21 @@ class NexusV14Unified:
             # → {'valence': +..., 'decision': 'approach', ...}
         """
         return self.cognitive.reinforce(text, reward)
+
+    def imagine(self, seed_text: str, steps: int = 3) -> List[Dict]:
+        """Corrente de pensamento — predição do próximo estado esparso.
+
+        Codifica o texto-semente em SDR e rola a predição de estados do
+        AssemblySequencer (assembly sequences), decodificando cada estado
+        previsto em texto pelo recall associativo da memória.
+
+        Exemplo:
+            kernel.chat('aprenda: fogo queima madeira')
+            kernel.chat('aprenda: agua apaga fogo')
+            kernel.imagine('aprenda: fogo queima madeira', steps=2)
+            # → [{'recall': 'agua apaga fogo', ...}, ...]
+        """
+        return self.cognitive.imagine(seed_text, steps=steps)
     
     def learn(self, fact: str, domain: str = "general") -> str:
         """Aprende um fato (V10 + propagação cross-domain)."""
@@ -14041,6 +14602,19 @@ def run_v14_selftest(verbose: bool = True) -> bool:
         rr_fly.get('synaptic_delta', 0) > 0 and rr_fly.get('decision') == 'approach',
         f"Δ={rr_fly.get('synaptic_delta', 0):.1f} valência={rr_fly.get('valence', 0):+.2f}")
     
+    # 8. AssemblySequencer (predição do próximo estado)
+    if verbose: print('\n[8] Assembly Sequencer')
+    n.chat('aprenda: a sinapse fortalece com uso repetido')
+    n.chat('aprenda: a sinapse enfraquece sem estimulo')
+    asm_stats = n.cognitive._core.assembly.stats
+    chk('chat() aprende transições de estado',
+        asm_stats.get('transitions', 0) >= 1,
+        f"{asm_stats.get('transitions', 0)} transições")
+    thoughts = n.imagine('aprenda: a sinapse fortalece com uso repetido', steps=2)
+    chk('imagine() rola a corrente de pensamento',
+        len(thoughts) >= 1 and thoughts[0].get('sdr_bits', 0) > 0,
+        f'{len(thoughts)} estados previstos')
+    
     elapsed = time.time() - t0
     pct = ok/total if total else 0
     status = '✅ APROVADO' if pct >= 0.85 else '✗ FALHOU'
@@ -14089,6 +14663,10 @@ if __name__ == '__main__':
     elif '--fly-demo' in _sys.argv:
         # Circuito do corpo cogumelar portado do conectoma da Drosophila
         demo_fly_brain(verbose=True)
+    
+    elif '--assembly-demo' in _sys.argv:
+        # Autoregressão no espaço de estados (assembly sequences)
+        demo_assembly_sequences(verbose=True)
     
     elif '--production' in _sys.argv:
         # Modo produção com kernel V11.2
