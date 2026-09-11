@@ -10701,6 +10701,49 @@ class NexusV10:
         """
         tl = text.lower().strip()
 
+        # V14.6: RESPOSTA FUNDAMENTADA — a recuperação alimenta a resposta.
+        # Antes do cascade lexical, os candidatos (FactStore + HybridRetriever)
+        # são re-ranqueados por cosseno denso no encoder semântico; se o
+        # melhor supera o limiar de relevância, a resposta É o fato recuperado
+        # (com um segundo fato complementar quando também relevante). Foi o
+        # elo que faltava: o sistema recuperava o fato certo (hit@5 30%) mas
+        # respondia com outro — a busca lexical por prefixo ("salário médio"
+        # para "empreiteiro médio") preemptava a recuperação semântica.
+        # Calibrado no modelo SQuAD: cosseno query↔fato-ouro mediana 0.66
+        # vs 0.31 para o top tipicamente errado.
+        try:
+            _prov = semantic_provider()
+            if _prov.neural:
+                qv = _prov.encode(text)
+                if qv is not None:
+                    _cands: List[str] = []
+                    _seen_c: Set[str] = set()
+                    for _h in self.fact_store.search(text, top_k=6, min_score=0.2):
+                        if _h not in _seen_c:
+                            _seen_c.add(_h)
+                            _cands.append(_h)
+                    for _s, _t, _src in self.retriever.retrieve(text, sdr, top_k=5):
+                        if _t not in _seen_c:
+                            _seen_c.add(_t)
+                            _cands.append(_t)
+                    _rer: List[Tuple[float, str]] = []
+                    _nqv = math.sqrt(sum(x * x for x in qv)) or 1e-9
+                    for _c in _cands[:10]:
+                        _cv = _prov.encode(_c)
+                        if _cv is None:
+                            continue
+                        _ncv = math.sqrt(sum(x * x for x in _cv)) or 1e-9
+                        _rer.append((sum(x * y for x, y in zip(qv, _cv))
+                                     / (_nqv * _ncv), _c))
+                    _rer.sort(key=lambda x: (-x[0], x[1]))
+                    if _rer and _rer[0][0] >= 0.35:
+                        _extra_g = ''
+                        if len(_rer) > 1 and _rer[1][0] >= 0.35:
+                            _extra_g = _rer[1][1]
+                        return self.mouth.speak_fact(_rer[0][1], _extra_g)
+        except Exception:
+            pass   # fallback total: segue o cascade original
+
         # Extrai domínio explícito da query (ex: "contexto Terra", "na Lua")
         # Usado para filtrar/priorizar fatos do mesmo domínio quando disponíveis.
         query_domain = _extract_domain(text)
