@@ -8471,6 +8471,9 @@ class NexusV10:
         self._reinforced: List[Tuple[str, 'SparseSDR']] = []
         # V14.7: novidade do último turno (sinal para a dopamina de curiosidade)
         self._last_novelty: float = 0.0
+        # V14.7b: habituação dopaminérgica — novidade repetida rende menos
+        # (a mosca habitua a estímulos recorrentes; o sono restaura parte)
+        self._curiosity_spent: int = 0
         # BeamGenerator: geração com beam search + reranking
         self.beam_gen = BeamGenerator(self.ngram, self.embed)
         # AttentionPool: IDF-weighted sentence vectors
@@ -9265,6 +9268,9 @@ class NexusV10:
         # estados não revisitadas decaem; o que foi recompensado resiste
         mb_forgotten = self.mushroom_body.forget()
         asm_forgotten = self.assembly.forget()
+        # V14.7b: o sono restaura metade da dopamina de curiosidade gasta
+        # (habituação decai com o descanso)
+        self._curiosity_spent = getattr(self, '_curiosity_spent', 0) // 2
         
         # V10: SDR Reasoner auto-generalization from brain memories
         if len(self.brain._memories) > 10:
@@ -9974,10 +9980,19 @@ class NexusV10:
         _nov = getattr(self, '_last_novelty', 0.0) or 0.0
         if (_nov >= 0.70 and '[dedup]' not in result.lower()
                 and '[inconsist' not in result.lower()):
-            try:
-                self.reinforce(text, 1.0 if _nov >= 0.85 else 0.4)
-            except Exception:
-                pass
+            # V14.7b: HABITUAÇÃO — a dopamina de curiosidade decai com o
+            # uso (0.95^gasto, piso 0.2); sem isso, todo fato novo é
+            # reforçado e a nota afetiva aparece em 100% das respostas
+            # (medido: 8/8 no treino SQuAD) — ruído, não opinião.
+            _spent = getattr(self, '_curiosity_spent', 0)
+            _base = 1.0 if _nov >= 0.85 else 0.4
+            _eff = _base * max(0.2, 0.95 ** _spent)
+            self._curiosity_spent = _spent + 1
+            if _eff >= 0.2:
+                try:
+                    self.reinforce(text, _eff)
+                except Exception:
+                    pass
         return result
 
     def _store_learned(self, text: str, sdr: SparseSDR) -> str:
@@ -11080,6 +11095,8 @@ class NexusV10:
             self.last_emotion = None
             self._reinforced = []
             self._last_novelty = 0.0
+        if not hasattr(self, '_curiosity_spent'):
+            self._curiosity_spent = 0
         # Restaura cada sub-sistema via from_dict
         if 'encoder' in data:
             self.encoder = MultiLobeEncoder.from_dict(data['encoder'])
@@ -12853,6 +12870,30 @@ def run_nexus_tests(verbose: bool = True) -> bool:
     chk('Voto da mosca desempata a favor do tema que a interessou',
         tb_tie[0][1] == _gdb,
         f'topo: {tb_tie[0][1][:40]!r}')
+
+    # V14.7b: habituação dopaminérgica — novidade repetida rende menos
+    # (estímulos semanticamente DISTANTES: a valência medida não pode
+    #  incluir herança por KCs compartilhados entre os fatos de teste)
+    n14e = NexusFinal()
+    n14e.disable_autosave()
+    n14e._last_novelty = 0.92
+    n14e._handle_learn('o telescopio gigante do deserto do atacama')
+    v_fresh = n14e.mushroom_body.readout(
+        n14e.semantic_encode('o telescopio gigante do deserto do atacama')
+    )['valence']
+    n14e._curiosity_spent = 80   # dopamina esgotada (fator no piso 0.2)
+    n14e._last_novelty = 0.92
+    n14e._handle_learn('a lampreia do rio parana tem sete branquias')
+    v_spent = n14e.mushroom_body.readout(
+        n14e.semantic_encode('a lampreia do rio parana tem sete branquias')
+    )['valence']
+    chk('Habituação: dopamina de curiosidade decai com o uso',
+        0.05 < v_spent < v_fresh * 0.6,
+        f'fresco valência={v_fresh:+.2f} → esgotado={v_spent:+.2f}')
+    n14e._curiosity_spent = 20
+    n14e.sleep(1)
+    chk('Sono restaura parte da dopamina de curiosidade',
+        n14e._curiosity_spent == 10, f'gasto: 20 → {n14e._curiosity_spent}')
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # RESULTADO FINAL
