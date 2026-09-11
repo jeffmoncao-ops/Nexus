@@ -8,7 +8,8 @@
 ║  FUSÃO COMPLETA: V10 Ultimate + V11.2 Production + V13 Evolution             ║
 ║                                                                              ║
 ║  CAMADA COGNITIVA (V10 Ultimate):                                            ║
-║  • SparseSDR 4096 bits — representação primária do conhecimento              ║
+║  • SparseSDR 10.000 bits — 60 ativos, esparsidade 0,6% (neocortical)         ║
+║  • SpikingCortex — neurônios LIF: leak + limiar + refratário + Hebbiano      ║
 ║  • MiniEmbed 768D — Word2Vec + FastText + Hebbiano                           ║
 ║  • CognitiveBrain — InvertedIndex O(1) recall                                ║
 ║  • ConceptGraph — analogia XOR, BFS, vizinhos ponderados                     ║
@@ -77,15 +78,25 @@ except ImportError:
 # §0  CONSTANTES GLOBAIS
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════════════════════
+# §0  CONSTANTES GLOBAIS — Espaço HDC 10.000 bits (esparsidade neocortical)
+# ──────────────────────────────────────────────────────────────────────────────
+# Escala biológica: o neocórtex humano mantém ~0,5–2% dos neurônios ativos
+# simultaneamente. O Nexus usa 60 bits ativos em 10.000 → 0,6% de esparsidade,
+# dentro da janela cortical. Semântica por sobreposição: dois conceitos que
+# compartilham N dos K bits ativos têm similaridade conceitual N/K
+# (ex.: 20/60 ≈ 33%); conceitos independentes colidem em 0–1 bit por ruído.
+# ──────────────────────────────────────────────────────────────────────────────
+
 VERSION    = 'v14-unified'
-SDR_SIZE   = 4096
-SDR_ACTIVE = 80
+SDR_SIZE   = 10000
+SDR_ACTIVE = 60
 SDR_SEED   = 0xDEAD_BEEF
 
-ZONE_SEMANTIC = (0,    2048)
-ZONE_CONTEXT  = (2048, 3072)
-ZONE_VALENCE  = (3072, 4096)
-ZONE_ACTIVE   = (30, 25, 25)   # bits por zona (total = 80)
+ZONE_SEMANTIC = (0,    5000)
+ZONE_CONTEXT  = (5000, 7500)
+ZONE_VALENCE  = (7500, 10000)
+ZONE_ACTIVE   = (30, 15, 15)   # bits por zona (total = 60) → 0.6%
 
 _STOP_PT: frozenset = frozenset({
     "o","a","os","as","um","uma","uns","umas","que","é","de","do","da",
@@ -210,7 +221,8 @@ def _deaccent(s: str) -> str:
 class SparseSDR:
     """
     SDR compacto: armazena só ÍNDICES dos bits ativos via array('H').
-    40 bits ativos = 80 bytes (vs 256 bytes num int de 2048 bits).
+    60 bits ativos em 10.000 = 120 bytes (vs 1,25 KB num vetor denso de bits).
+    Esparsidade: 60/10.000 = 0,6% — dentro da janela neocortical (~0,5–2%).
     """
     __slots__ = ('_idx',)
 
@@ -263,6 +275,10 @@ class SparseSDR:
         a = set(self._idx)
         if not a: return 0.0
         return len(a & set(other._idx)) / len(a)
+
+    def overlap_count(self, other: 'SparseSDR') -> int:
+        """Nº de bits ativos compartilhados (semântica N/K do HDC)."""
+        return len(set(self._idx) & set(other._idx))
 
     def invert_sparse(self) -> 'SparseSDR':
         active = set(self._idx)
@@ -348,7 +364,7 @@ class InvertedIndex:
 class SemanticSDREncoder:
     """SDR semântico via Locality-Sensitive Hashing (LSH).
 
-    Transforma o vetor denso do MiniEmbed (128 floats) em SDR esparso (40/2048)
+    Transforma o vetor denso do MiniEmbed em SDR esparso (60/10.000 bits)
     preservando a estrutura de vizinhança: palavras similares no espaço embed
     → alto Jaccard no SDR → CognitiveBrain faz recall semântico cruzado.
 
@@ -381,15 +397,17 @@ class SemanticSDREncoder:
     Com corpus rico (1000+ frases por domínio), sep_LSH ≈ +0.30 a +0.60.
     """
 
-    SDR_SIZE = 4096
-    ACTIVE   = 40
+    SDR_SIZE = 10000   # espaço HDC global (N = 10.000 bits)
+    ACTIVE   = 60      # 60 bits ativos → esparsidade 0,6%
 
     def __init__(self, embed_dim: int = 128):
         self.dim      = embed_dim
         self._updates = 0   # sempre 0 — LSH não aprende
         # Matriz de projeção: SDR_SIZE vetores aleatórios normalizados
         # Determinística via hash → mesma matriz em toda instância
-        self._R: List[List[float]] = []
+        # Linhas em array('f'): 10.000×768 floats empacotados (~30 MB)
+        # em vez de listas de floats (~250 MB) — essencial no modo puro.
+        self._R: List[array.array] = []
         for i in range(self.SDR_SIZE):
             seed = (i * 6364136223846793005 + 1442695040888963407) & 0xFFFFFFFF
             v = []
@@ -399,7 +417,7 @@ class SemanticSDREncoder:
                 # Aproxima distribuição normal via log-transform
                 v.append(math.log(u))
             nrm = math.sqrt(sum(x*x for x in v)) or 1.0
-            self._R.append([x/nrm for x in v])
+            self._R.append(array.array('f', [x/nrm for x in v]))
 
     def encode(self, embed_vec: List[float], learn: bool = False) -> SparseSDR:
         """Projeta embed_vec em SDR semântico via SimHash.
@@ -445,10 +463,10 @@ class SemanticSDREncoder:
 class MultiLobeEncoder:
     """
     Encoder deterministico de 3 zonas:
-      - Semântica  [0..1024]:   conteúdo dos tokens + ngrams char
-      - Contexto   [1024..1536]: domínio detectado
-      - Valência   [1536..2048]: polaridade positiva/negativa
-    SparseSDR: 40 bits ativos, 25× mais compacto que int bitmask.
+      - Semântica  [0..5000]:    conteúdo dos tokens + ngrams char
+      - Contexto   [5000..7500]: domínio detectado
+      - Valência   [7500..10000]: polaridade positiva/negativa
+    SparseSDR: 60 bits ativos (30+15+15) → 0,6% de esparsidade.
     """
     BITS_PER_TOKEN = 3
     NGRAM_SIZES    = (2, 3)
@@ -6123,6 +6141,406 @@ class TemporalMemory:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# §V10b  CÓRTEX SPIKING — Neurônios LIF + Plasticidade Hebbiana + Refratário
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Os nós do Nexus evoluem de uma simples verificação de sobreposição (overlap)
+# para um mecanismo biológico de Leaky Integrate-and-Fire (LIF):
+#
+#   • Potencial de membrana (V_m): acumula a corrente gerada pelos bits ativos
+#     do SDR de entrada multiplicados pelos pesos sinápticos.
+#   • Vazamento (leak): a cada passo de tempo V_m decai — dissipação iônica
+#     celular; sem estimulação constante, o traço decai a zero.
+#   • Limiar de disparo (V_th) + período refratário: ao atingir o limiar o
+#     neurônio gera um spike (1), zera o potencial e fica imune a novos
+#     estímulos por alguns ciclos — forçando a rede a DISTRIBUIR a
+#     representação temporal entre neurônios vizinhos.
+#   • Plastificação sináptica (Hebbiano): "neurônios que disparam juntos, se
+#     conectam" — as sinapses que receberam sinal do SDR no momento do
+#     disparo fortalecem suas conexões (clip [0, 1] evita explosão).
+#
+# Semântica emergente: como "gato" e "cachorro" compartilham bits com
+# "mamífero", os neurônios potenciados por um conceito atingem o limiar muito
+# mais rápido diante do conceito irmão do que diante de "carro" — o
+# agrupamento semântico cortical emerge no próprio hardware simulado.
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def create_sdr_with_overlap(base_sdr: Optional['SparseSDR'] = None,
+                            shared_bits: int = 0,
+                            k_active: int = SDR_ACTIVE,
+                            seed: Optional[int] = None) -> 'SparseSDR':
+    """Gera um SDR de N=10.000 bits com K=60 ativos (esparsidade 0,6%).
+
+    Semântica por sobreposição: se `base_sdr` for fornecido, o novo SDR
+    compartilha exatamente `shared_bits` bits ativos com a base (conceito
+    semanticamente próximo); os bits restantes são sorteados fora da base
+    (colisão por mero ruído: 0–1 bit entre conceitos independentes).
+    """
+    rng = random.Random(seed) if seed is not None else random.Random()
+
+    if base_sdr is not None and shared_bits > 0:
+        base_idx = base_sdr.to_list()
+        shared_bits = min(shared_bits, len(base_idx), k_active)
+        shared = rng.sample(base_idx, shared_bits)
+        base_set = set(base_idx)
+        # Complemento da base: bits livres para semântica própria
+        complement = [i for i in range(SDR_SIZE) if i not in base_set]
+        need = k_active - shared_bits
+        if need > 0:
+            shared.extend(rng.sample(complement, min(need, len(complement))))
+        return SparseSDR.from_indices(shared)
+
+    active = rng.sample(range(SDR_SIZE), k_active)
+    return SparseSDR.from_indices(active)
+
+
+class SpikingCortex:
+    """
+    População de neurônios spiking (Leaky Integrate-and-Fire) acoplada ao
+    espaço HDC/SDR de 10.000 bits.
+
+    Cada neurônio mantém:
+      - V_m ............. potencial de membrana (integra + vaza)
+      - V_th ............ limiar de disparo
+      - refratário ...... contador de ciclos de imunidade pós-spike
+      - pesos sinápticos . vetor de 10.000 floats (array('f'), ~40 KB)
+
+    Conectividade esparssa (biólogica): cada neurônio escuta apenas uma
+    fração `connectivity` dos 10.000 bits (default 10%, como no córtex,
+    onde um neurônio piramidal recebe de ~10% dos axônios disponíveis).
+    Pesos conectados iniciam fracos, uniformes em w_init=(0.01, 0.05).
+    Resultado: para um SDR com K=60 bits ativos, cada neurônio soma a
+    corrente de apenas ~6 sinapses — a distribuição de drives entre a
+    população é ampla, e só a CAUDA (o pequeno grupo cujo campo receptivo
+    intersecta bem o estímulo) atinge o limiar. V_th=0.3 é calibrado para
+    essa cauda (~10-20% da população dispara no primeiro passo).
+
+    O Hebbiano fortalece TODOS os bits ativos do SDR no momento do disparo
+    (inclusive sinapses ainda silenciosas → o campo receptivo CRESCE e
+    consolida o conceito; peso 0 → 0.02 = nova sinapse formada).
+
+    O custo por passo é O(num_neurons × K_ACTIVE): a corrente de entrada é
+    somada apenas sobre os 60 bits ativos do SDR (aritmética esparssa), não
+    sobre os 10.000 bits do espaço.
+
+    Uso:
+        cortex = SpikingCortex(num_neurons=50)
+        gato   = create_sdr_with_overlap(seed=1)
+        for t in range(5):
+            spikes = cortex.step(gato)      # ids dos neurônios que dispararam
+    """
+
+    def __init__(self,
+                 num_neurons: int = 50,
+                 input_dim: int = SDR_SIZE,
+                 seed: int = SDR_SEED,
+                 v_rest: float = 0.0,
+                 v_thresh: float = 0.3,
+                 decay_rate: float = 0.85,
+                 refractory_period: int = 3,
+                 learning_rate: float = 0.02,
+                 connectivity: float = 0.10,
+                 w_init: Tuple[float, float] = (0.01, 0.05),
+                 w_max: float = 1.0):
+        self.num_neurons       = num_neurons
+        self.input_dim         = input_dim
+        self.seed              = seed
+        self.v_rest            = v_rest
+        self.v_thresh          = v_thresh
+        self.decay_rate        = decay_rate
+        self.refractory_period = refractory_period
+        self.learning_rate     = learning_rate
+        self.connectivity      = connectivity
+        self.w_init            = w_init
+        self.w_max             = w_max
+
+        # Pesos iniciais: conectividade ESPARSA (campo receptivo ~10% dos
+        # bits) com intensidade fraca uniforme — determinístico via seed.
+        # Bits fora do campo receptivo pesam 0 (sinapse silenciosa).
+        rng = random.Random(seed)
+        lo, hi = w_init
+        span = hi - lo
+        self.weights: List[array.array] = []
+        for _ in range(num_neurons):
+            row = array.array('f', bytes(4 * input_dim))   # zeros
+            for j in range(input_dim):
+                if rng.random() < connectivity:
+                    row[j] = lo + span * rng.random()
+            self.weights.append(row)
+
+        # Estado dinâmico
+        self._v_m: List[float]        = [v_rest] * num_neurons
+        self._refractory: List[int]   = [0] * num_neurons
+        self._spike_count: List[int]  = [0] * num_neurons
+        self.total_spikes: int        = 0
+        self._t: int                  = 0
+        self.history: deque           = deque(maxlen=256)   # (t, ids_spikados)
+        # Sinapses efetivamente potenciadas pelo Hebbiano
+        # (neuron_id → {bit: peso final}) — base para persistência
+        self._trained: Dict[int, Dict[int, float]] = {}
+
+    # ── Dinâmica temporal ────────────────────────────────────────────────────
+
+    def step(self, input_sdr, learn: bool = True) -> List[int]:
+        """Um passo de tempo discreto da população.
+
+        input_sdr: SparseSDR (ou iterável de índices ativos).
+        Retorna a lista de ids dos neurônios que dispararam neste passo.
+        """
+        if isinstance(input_sdr, SparseSDR):
+            active = input_sdr.to_list()
+        else:
+            active = [int(i) for i in input_sdr]
+
+        spiked: List[int] = []
+        lr = self.learning_rate
+        for i in range(self.num_neurons):
+            # 1. Período refratário: imune a estímulos, potencial em repouso
+            if self._refractory[i] > 0:
+                self._refractory[i] -= 1
+                self._v_m[i] = self.v_rest
+                continue
+
+            # 2. Integração: soma ponderada APENAS dos bits ativos (esparso)
+            w = self.weights[i]
+            current = 0.0
+            for j in active:
+                current += w[j]
+
+            # 3. Leak + corrente de entrada
+            self._v_m[i] = self._v_m[i] * self.decay_rate + current
+
+            # 4. Disparo: spike → zera V_m → entra em refratário
+            if self._v_m[i] >= self.v_thresh:
+                spiked.append(i)
+                self._v_m[i] = self.v_rest
+                self._refractory[i] = self.refractory_period
+                self._spike_count[i] += 1
+                self.total_spikes += 1
+
+                # 5. Hebbiano: sinapses ativas no momento do disparo fortalecem
+                if learn:
+                    syn = self._trained.setdefault(i, {})
+                    for j in active:
+                        nv = w[j] + lr
+                        w[j] = self.w_max if nv > self.w_max else nv
+                        syn[j] = w[j]
+
+        self._t += 1
+        self.history.append((self._t, tuple(spiked)))
+        return spiked
+
+    def present(self, input_sdr, steps: int = 1,
+                learn: bool = True) -> List[List[int]]:
+        """Apresenta um estímulo por `steps` passos seguidos.
+
+        Retorna a lista de disparos por passo — o refratário força a
+        representação temporal a ROTAR entre neurônios ao longo dos passos.
+        """
+        return [self.step(input_sdr, learn=learn) for _ in range(steps)]
+
+    def observe(self, input_sdr, label: str = '') -> List[int]:
+        """Um passo de percepção (usado pelo pipeline de chat). Alias de step()."""
+        return self.step(input_sdr, learn=True)
+
+    # ── Medição (sem efeitos colaterais) ─────────────────────────────────────
+
+    def drive(self, input_sdr) -> List[float]:
+        """Corrente sináptica instantânea por neurônio (só leitura).
+
+        Mede quanta carga o estímulo injeta em cada neurônio — útil para
+        verificar potenciação Hebbiana: o drive de um conceito cresce após
+        treino com conceito semanticamente próximo e fica inalterado para
+        conceitos independentes.
+        """
+        if isinstance(input_sdr, SparseSDR):
+            active = input_sdr.to_list()
+        else:
+            active = [int(i) for i in input_sdr]
+        return [sum(w[j] for j in active) for w in self.weights]
+
+    def mean_potential(self) -> float:
+        """V_m médio da população."""
+        if not self._v_m:
+            return 0.0
+        return sum(self._v_m) / len(self._v_m)
+
+    def reset_state(self) -> None:
+        """Zera a dinâmica (V_m, refratário, histórico) — mantém os pesos aprendidos."""
+        self._v_m          = [self.v_rest] * self.num_neurons
+        self._refractory   = [0] * self.num_neurons
+        self._t            = 0
+        self.history.clear()
+
+    # ── Serialização ─────────────────────────────────────────────────────────
+
+    @property
+    def stats(self) -> Dict:
+        return {
+            'neurons': self.num_neurons,
+            'input_dim': self.input_dim,
+            'total_spikes': self.total_spikes,
+            'active_neurons': sum(1 for c in self._spike_count if c > 0),
+            'consolidated_synapses': sum(len(s) for s in self._trained.values()),
+            'mean_potential': round(self.mean_potential(), 4),
+            'mean_spike_count': (sum(self._spike_count) / self.num_neurons
+                                 if self.num_neurons else 0.0),
+        }
+
+    def to_dict(self) -> dict:
+        """Persiste apenas as sinapses CONSOLIDADAS (potenciadas pelo Hebbiano).
+
+        Os pesos iniciais são determinísticos (seed) e recalculáveis; só vale a
+        pena guardar o que o aprendizado mudou — o registro esparso _trained
+        captura cada sinapse no momento da potenciação.
+        Biologicamente: só o wiring consolidado sobrevive ao sono.
+        """
+        consolidated = {i: {j: round(w, 4) for j, w in syn.items()}
+                        for i, syn in self._trained.items()}
+        return {
+            'num_neurons': self.num_neurons,
+            'input_dim': self.input_dim,
+            'seed': self.seed,
+            'v_thresh': self.v_thresh,
+            'decay_rate': self.decay_rate,
+            'refractory_period': self.refractory_period,
+            'learning_rate': self.learning_rate,
+            'connectivity': self.connectivity,
+            'w_init': list(self.w_init),
+            'w_max': self.w_max,
+            'total_spikes': self.total_spikes,
+            'spike_count': list(self._spike_count),
+            'synapses': {str(k): v for k, v in consolidated.items()},
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> 'SpikingCortex':
+        cortex = cls(
+            num_neurons=d.get('num_neurons', 50),
+            input_dim=d.get('input_dim', SDR_SIZE),
+            seed=d.get('seed', SDR_SEED),
+            v_thresh=d.get('v_thresh', 0.3),
+            decay_rate=d.get('decay_rate', 0.85),
+            refractory_period=d.get('refractory_period', 3),
+            learning_rate=d.get('learning_rate', 0.02),
+            connectivity=d.get('connectivity', 0.10),
+            w_init=tuple(d.get('w_init', (0.01, 0.05))),
+            w_max=d.get('w_max', 1.0),
+        )
+        cortex.total_spikes  = d.get('total_spikes', 0)
+        cortex._spike_count  = list(d.get('spike_count', [0] * cortex.num_neurons))
+        # restaura apenas as sinapses consolidadas sobre a base determinística
+        for i_str, syn in d.get('synapses', {}).items():
+            i = int(i_str)
+            if 0 <= i < cortex.num_neurons:
+                w = cortex.weights[i]
+                restored: Dict[int, float] = {}
+                for j, val in syn.items():
+                    j = int(j)
+                    if 0 <= j < cortex.input_dim:
+                        w[j] = val
+                        restored[j] = val
+                if restored:
+                    cortex._trained[i] = restored
+        return cortex
+
+
+def demo_spiking_cortex(verbose: bool = True) -> Dict:
+    """
+    Simulação de referência: propagação de estímulos em tempo discreto através
+    de neurônios spiking LIF acoplados a SDRs de 10.000 bits.
+
+    Vocabulário com semântica compartilhada:
+      - mamífero ... conceito base (60 bits aleatórios)
+      - gato ....... compartilha 25 bits com mamífero
+      - cachorro ... compartilha 22 bits com mamífero
+      - carro ...... totalmente independente (colisão ~0–1 bit por ruído)
+    """
+    rng_seed = 42
+    sdr_mamifero = create_sdr_with_overlap(seed=rng_seed)
+    sdr_gato     = create_sdr_with_overlap(sdr_mamifero, shared_bits=25, seed=rng_seed + 1)
+    sdr_cachorro = create_sdr_with_overlap(sdr_mamifero, shared_bits=22, seed=rng_seed + 2)
+    sdr_carro    = create_sdr_with_overlap(seed=rng_seed + 3)
+
+    cortex = SpikingCortex(num_neurons=50)
+
+    if verbose:
+        print('=== SIMULAÇÃO DE REDE NEURONAL COM SDR (10.000 bits) ===')
+        print(f'Sparsity por vetor: {SDR_ACTIVE}/{SDR_SIZE} bits '
+              f'({(SDR_ACTIVE / SDR_SIZE) * 100:.1f}%)')
+        for name, sdr in (('gato', sdr_gato), ('cachorro', sdr_cachorro),
+                          ('carro', sdr_carro)):
+            shared = sdr.overlap_count(sdr_mamifero)
+            pct = shared / SDR_ACTIVE * 100
+            print(f'Similaridade {name}↔mamífero: {shared}/60 bits ({pct:.0f}%)')
+        shared_gc = sdr_gato.overlap_count(sdr_carro)
+        print(f'Similaridade gato↔carro:    {shared_gc}/60 bits '
+              f'({shared_gc / SDR_ACTIVE * 100:.0f}% — colisão por ruído)')
+        print()
+
+    report: Dict = {'sparsity': SDR_ACTIVE / SDR_SIZE, 'stimuli': {}}
+
+    first_contact: Dict[str, int] = {}
+    for label, sdr, steps in (('GATO', sdr_gato, 5),
+                              ('CACHORRO', sdr_cachorro, 3),
+                              ('CARRO', sdr_carro, 3)):
+        if verbose:
+            sem = ('semântica próxima' if label != 'CARRO'
+                   else 'semântica distante')
+            print(f'--- Apresentando estímulo: {label!r} ({sem}) ---')
+        timeline = []
+        for t in range(steps):
+            spikes = cortex.step(sdr)
+            timeline.append(spikes)
+            if verbose:
+                print(f'Passo {t + 1}: {len(spikes):2d} disparos -> {spikes}')
+        first_contact[label] = len(timeline[0]) if timeline else 0
+        report['stimuli'][label] = {
+            'timeline': timeline,
+            'total_spikes': sum(len(s) for s in timeline),
+        }
+        if verbose:
+            print()
+
+    # Finale: re-exposição pós-treino — a potenciação Hebbiana acelera o
+    # reconhecimento de conceitos já vistos. Note o contraste no 1º passo de
+    # cada conceito NOVO: cachorro (compartilha bits com a família treinada)
+    # dispara imediatamente; carro (independente) só dispara depois de
+    # integrar corrente por vários passos — agrupamento semântico emergente.
+    cortex.reset_state()
+    if verbose:
+        print('--- Re-expondo GATO após treino (potenciação Hebbiana) ---')
+    tl_gato = []
+    for t in range(3):
+        spikes = cortex.step(sdr_gato)
+        tl_gato.append(spikes)
+        if verbose:
+            print(f'Passo {t + 1}: {len(spikes):2d} disparos -> {spikes}')
+    report['potentiation'] = {
+        'gato_first_contact': first_contact.get('GATO', 0),
+        'gato_after_training': len(tl_gato[0]) if tl_gato else 0,
+        'cachorro_first_contact': first_contact.get('CACHORRO', 0),
+        'carro_first_contact': first_contact.get('CARRO', 0),
+    }
+    if verbose:
+        pot = report['potentiation']
+        print()
+        print(f"Gato: {pot['gato_first_contact']} disparos no 1º contato "
+              f"→ {pot['gato_after_training']} após treino (sinapses consolidadas)")
+        print(f"1º passo — cachorro (semântica próxima, nunca visto): "
+              f"{pot['cachorro_first_contact']} disparos")
+        print(f"1º passo — carro (semântica distante, nunca visto):    "
+              f"{pot['carro_first_contact']} disparos")
+        st = cortex.stats
+        print(f'\nEstatística da rede: {st["active_neurons"]}/{st["neurons"]} '
+              f'neurônios ativos, {st["total_spikes"]} spikes, '
+              f'{st["consolidated_synapses"]} sinapses consolidadas')
+    report['stats'] = cortex.stats
+    return report
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # §V10  SDR REASONER — raciocínio lógico via operações bitwise
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -6661,6 +7079,9 @@ class NexusV10:
         self.pred_cache = PredictiveCache()
         # RepresentationalBus: comunicação inter-módulo via SDR
         self.rep_bus = RepresentationalBus()
+        # SpikingCortex: neurônios LIF (leak + limiar + refratário + Hebbiano)
+        # acoplados ao espaço HDC — toda percepção do chat passa pela camada
+        self.spiking_cortex = SpikingCortex()
         # BeamGenerator: geração com beam search + reranking
         self.beam_gen = BeamGenerator(self.ngram, self.embed)
         # AttentionPool: IDF-weighted sentence vectors
@@ -6983,6 +7404,27 @@ class NexusV10:
             return self.sp_encoder.encode(vec, learn=False)
         return self.encoder.encode(text)
 
+    def perceive(self, text: str, steps: int = 3) -> Dict:
+        """Percepção sensorial no córtex spiking (neurônios LIF).
+
+        Codifica o texto em SDR (10.000 bits, 60 ativos) e apresenta o
+        estímulo à população LIF por `steps` passos de tempo. Retorna o
+        relatório da dinâmica: disparos por passo, potenciação sináptica
+        e estatísticas da população.
+        """
+        sdr = self.semantic_encode(text)
+        before = self.spiking_cortex.stats.get('consolidated_synapses', 0)
+        timeline = self.spiking_cortex.present(sdr, steps=steps, learn=True)
+        after = self.spiking_cortex.stats.get('consolidated_synapses', 0)
+        return {
+            'text': text[:60],
+            'sdr_active_bits': len(sdr),
+            'timeline': timeline,
+            'spikes_total': sum(len(s) for s in timeline),
+            'new_synapses': after - before,
+            'cortex': self.spiking_cortex.stats,
+        }
+
 
     # ── [V9→FINAL FIX] Código de auto-persistência foi movido
     # ── para dentro do __init__ (estava em código morto após return).
@@ -7100,6 +7542,10 @@ class NexusV10:
             self.homeostasis.on_novel_input()
             # Boost de surpresa: amplifica bits raros no SDR
             sdr = self.novelty.surprise_boost(sdr)
+
+        # V14: percepção no córtex spiking — o SDR estimula a população LIF
+        # (integração → leak → disparo → refratário → potenciação Hebbiana)
+        self.spiking_cortex.observe(sdr, label=text[:40])
         
         # V10: Predictive cache — busca resposta pré-computada
         cached = self.pred_cache.get_by_sdr(sdr, min_overlap=0.35)
@@ -7468,6 +7914,10 @@ class NexusV10:
                 'ctx_topic_vec':  self._ctx_topic_vec,
                 'ctx_entities':   self._ctx_entities,
                 'ctx_turn':       self._ctx_turn,
+                # V14: Córtex spiking (sinapses Hebbianas consolidadas)
+                'spiking_cortex': (self.spiking_cortex.to_dict()
+                                  if getattr(self, 'spiking_cortex', None)
+                                  else None),
             }
             dir_ = os.path.dirname(os.path.abspath(filepath))
             # Cria o temporário no mesmo sistema de arquivos para garantir
@@ -7538,6 +7988,10 @@ class NexusV10:
             n._pending_confirm = None
         n._dialog_ctx = []  # não persistido — janela de diálogo reinicia a cada sessão
         n._facts_since_sleep = 0
+        # V14: restaura córtex spiking (sinapses Hebbianas consolidadas)
+        cortex_data = data.get('spiking_cortex')
+        n.spiking_cortex = (SpikingCortex.from_dict(cortex_data)
+                            if cortex_data else SpikingCortex())
         def _auto_promote(belief: Belief, brain: CognitiveBrain) -> None:
             brain.store(belief.sdr, belief.text, tag='FACT',
                         confidence=belief.confidence)
@@ -8906,6 +9360,10 @@ class NexusV10:
         else:
             self.sp_encoder  = None
             self._sp_trained = False
+        # V14: Córtex spiking — sinapses Hebbianas consolidadas
+        cortex_data = data.get('spiking_cortex')
+        if cortex_data:
+            self.spiking_cortex = SpikingCortex.from_dict(cortex_data)
         # rev.8: ContextEngine
         dim = self.embed.DIM
         self._ctx_topic_vec = data.get('ctx_topic_vec', [0.0]*dim)
@@ -9127,7 +9585,10 @@ class NexusV10:
                 f"  Inconsistências: {consist_n}\n"
                 f"  Homeostase     : {s.get('homeostasis', 'ok')}\n"
                 f"  ─── V10 Módulos ───\n"
-                f"  SDR             : {SDR_SIZE} bits, {SDR_ACTIVE} ativos\n"
+                f"  SDR             : {SDR_SIZE} bits, {SDR_ACTIVE} ativos "
+                f"({SDR_ACTIVE / SDR_SIZE * 100:.1f}% — neocortical)\n"
+                f"  Córtex LIF      : {self.spiking_cortex.stats['neurons']} neurônios, "
+                f"{self.spiking_cortex.stats['consolidated_synapses']} sinapses Hebbianas\n"
                 f"  Embed DIM       : {self.embed.DIM}d\n"
                 f"  XOR Bindings    : {self.xor_bind.size}\n"
                 f"  Novelty média   : {self.novelty.recent_novelty():.3f}\n"
@@ -9196,42 +9657,44 @@ class NexusV10:
 if __name__ == '__main__':
     import sys
 
-    print('=' * 60)
-    print('NEXUS V10 ULTIMATE — Sistema Cognitivo SDR-First')
-    print('=' * 60)
+    # Flags delegadas ao entry point V14 unificado (final do arquivo)
+    _V14_FLAGS = ('--demo', '--lif-demo', '--production')
+    if not any(f in sys.argv for f in _V14_FLAGS):
+        print('=' * 60)
+        print('NEXUS V10 ULTIMATE — Sistema Cognitivo SDR-First')
+        print('=' * 60)
 
-    n = NexusV10()
+        n = NexusV10()
 
-    if len(sys.argv) > 1 and sys.argv[1] == '--test':
-        # Modo teste rápido
-        tests = [
-            ('aprenda: variável é um espaço de memória nomeado que armazena valores', 'Aprendi'),
-            ('o que é variável?', 'memória'),
-            ('implemente fibonacci', 'fibonacci'),
-            ('calcule 2 + 2 * 3', '8'),
-        ]
-        ok = 0
-        for prompt, expected in tests:
-            resp = n.chat(prompt)
-            passed = expected.lower() in resp.lower()
-            print(f'  {"✓" if passed else "✗"} {prompt[:50]} → {resp[:60]}')
-            if passed:
-                ok += 1
-        print(f'\n{ok}/{len(tests)} testes básicos passando.')
-    else:
-        # Modo interativo
-        print('Digite "sair" para encerrar.\n')
-        while True:
-            try:
-                user = input('> ').strip()
-            except (EOFError, KeyboardInterrupt):
-                print('\nAté mais!')
-                break
-            if user.lower() in ('sair', 'exit', 'quit'):
-                break
-            if user:
-                print(n.chat(user))
-
+        if len(sys.argv) > 1 and sys.argv[1] == '--test':
+            # Modo teste rápido
+            tests = [
+                ('aprenda: variável é um espaço de memória nomeado que armazena valores', 'Aprendi'),
+                ('o que é variável?', 'memória'),
+                ('implemente fibonacci', 'fibonacci'),
+                ('calcule 2 + 2 * 3', '8'),
+            ]
+            ok = 0
+            for prompt, expected in tests:
+                resp = n.chat(prompt)
+                passed = expected.lower() in resp.lower()
+                print(f'  {"✓" if passed else "✗"} {prompt[:50]} → {resp[:60]}')
+                if passed:
+                    ok += 1
+            print(f'\n{ok}/{len(tests)} testes básicos passando.')
+        else:
+            # Modo interativo
+            print('Digite "sair" para encerrar.\n')
+            while True:
+                try:
+                    user = input('> ').strip()
+                except (EOFError, KeyboardInterrupt):
+                    print('\nAté mais!')
+                    break
+                if user.lower() in ('sair', 'exit', 'quit'):
+                    break
+                if user:
+                    print(n.chat(user))
 
 # ══════════════════════════════════════════════════════════════════════════════
 # §26  ALIAS PÚBLICO — NexusFinal
@@ -9779,6 +10242,10 @@ class GlobalWorkspaceNexus:
     def status(self) -> Dict:
         return self._core.status()
 
+    def perceive(self, text: str, steps: int = 3) -> Dict:
+        """Percepção no córtex spiking LIF (delega ao núcleo V10)."""
+        return self._core.perceive(text, steps=steps)
+
     def deep_scan(self, corpus: str) -> str:
         return self._core.deep_scan(corpus)
 
@@ -9795,6 +10262,8 @@ class GlobalWorkspaceNexus:
     def encoder(self):    return self._core.encoder
     @property
     def edge_net(self):   return self._core.edge_net
+    @property
+    def spiking_cortex(self): return self._core.spiking_cortex
     @property
     def concept_graph(self): return self._core.concept_graph
     @property
@@ -10129,6 +10598,82 @@ def run_nexus_tests(verbose: bool = True) -> bool:
     chk('Raciocínio IS_A/transitivo', len(r_ded) > 5, r_ded[:60])
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # BLOCO 11 — SDR 10.000 bits (0,6%) + Córtex Spiking LIF
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    if verbose: print('\n[B11] SDR 10.000 bits (0,6%) + Córtex Spiking LIF')
+
+    # Esparsidade do espaço HDC (escala neocortical)
+    chk('Espaço HDC: 10.000 bits, 60 ativos (0,6%)',
+        SDR_SIZE == 10000 and SDR_ACTIVE == 60
+        and abs(SDR_ACTIVE / SDR_SIZE - 0.006) < 1e-9,
+        f'{SDR_ACTIVE}/{SDR_SIZE} = {SDR_ACTIVE / SDR_SIZE * 100:.1f}%')
+
+    # Semântica por sobreposição (N/K)
+    sdr_mam   = create_sdr_with_overlap(seed=101)
+    sdr_gato  = create_sdr_with_overlap(sdr_mam, shared_bits=25, seed=102)
+    sdr_carro = create_sdr_with_overlap(seed=103)
+    chk('SDR gerado tem exatamente 60 bits ativos',
+        len(sdr_gato) == 60, f'{len(sdr_gato)} bits')
+    chk('Gato compartilha 25 bits com mamífero',
+        sdr_gato.overlap_count(sdr_mam) == 25,
+        f'{sdr_gato.overlap_count(sdr_mam)} bits (~42% similaridade)')
+    chk('Carro colide em ≤2 bits (ruído aleatório)',
+        sdr_carro.overlap_count(sdr_mam) <= 2,
+        f'{sdr_carro.overlap_count(sdr_mam)} bits')
+
+    # Dinâmica LIF: disparo + período refratário
+    cortex = SpikingCortex(num_neurons=50)
+    tl = cortex.present(sdr_gato, steps=6)
+    consec = [i for t in range(len(tl) - 1) for i in tl[t] if i in tl[t + 1]]
+    chk('Neurônios LIF disparam sob estímulo',
+        cortex.total_spikes > 0, f'{cortex.total_spikes} spikes em 6 passos')
+    chk('Período refratário: sem disparos em passos consecutivos',
+        not consec, f'violações={len(consec)}')
+
+    # Vazamento (leak): V_m decai sem estimulação
+    # (V_m inicial 0.25 fica ABAIXO do limiar 0.3 → nenhum disparo, só leak)
+    cortex_leak = SpikingCortex(num_neurons=10)
+    cortex_leak._v_m = [0.25] * 10
+    cortex_leak.step(SparseSDR())
+    chk('Leak: V_m decai sem estímulo (0.25 → 0.2125)',
+        abs(cortex_leak.mean_potential() - 0.2125) < 1e-9,
+        f'V_m→{cortex_leak.mean_potential():.4f}')
+
+    # Plasticidade Hebbiana: potencia o conceito treinado, não o independente
+    cortex_h = SpikingCortex(num_neurons=50)
+    d0 = sum(cortex_h.drive(sdr_gato)) / 50
+    c0 = sum(cortex_h.drive(sdr_carro)) / 50
+    cortex_h.present(sdr_gato, steps=4)
+    d1 = sum(cortex_h.drive(sdr_gato)) / 50
+    c1 = sum(cortex_h.drive(sdr_carro)) / 50
+    chk('Hebbiano potencia sinapses do conceito treinado',
+        d1 > d0 * 1.5, f'drive {d0:.2f}→{d1:.2f} (+{(d1 / d0 - 1) * 100:.0f}%)')
+    chk('Conceito independente não é potenciado',
+        abs(c1 - c0) < 1e-9, f'{c0:.3f}→{c1:.3f}')
+
+    # Serialização: sinapses consolidadas sobrevivem ao round-trip
+    snap = cortex_h.to_dict()
+    cortex_r = SpikingCortex.from_dict(snap)
+    bits_g = sdr_gato.to_list()
+    dmax = max(abs(cortex_h.weights[i][j] - cortex_r.weights[i][j])
+               for i in range(50) for j in bits_g)
+    chk('Serialização preserva sinapses Hebbianas',
+        dmax < 1e-3, f'Δmáx={dmax:.5f}')
+
+    # Integração: perceive() no pipeline cognitivo
+    n11 = NexusFinal()
+    n11.disable_autosave()
+    rep = n11.perceive('gato caça rato à noite', steps=3)
+    chk('perceive() integra córtex LIF ao pipeline',
+        isinstance(rep, dict) and rep.get('sdr_active_bits') == 60
+        and rep.get('spikes_total', 0) > 0,
+        f"bits={rep.get('sdr_active_bits')} spikes={rep.get('spikes_total')}")
+    chk('chat() observa estímulos no córtex (dinâmica temporal)',
+        n11.spiking_cortex.total_spikes > 0,
+        f"{n11.spiking_cortex.total_spikes} spikes acumulados")
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # RESULTADO FINAL
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -10151,43 +10696,47 @@ def run_nexus_tests(verbose: bool = True) -> bool:
 if __name__ == '__main__':
     import sys as _sys
 
-    print('=' * 70)
-    print('NEXUS FINAL + GLOBAL WORKSPACE — Sistema Cognitivo com Multi-Cérebros')
-    print('=' * 70)
-
     if '--test' in _sys.argv:
+        print('=' * 70)
+        print('NEXUS FINAL + GLOBAL WORKSPACE — Sistema Cognitivo com Multi-Cérebros')
+        print('=' * 70)
         ok = run_nexus_tests(verbose=True)
         _sys.exit(0 if ok else 1)
 
-    if '--gw' in _sys.argv or '--global' in _sys.argv:
-        # Modo GlobalWorkspace interativo
-        print('\nIniciando com Área de Trabalho Global (multi-brain)...')
-        n = GlobalWorkspaceNexus()
-        print('GlobalWorkspace ativo com', len(n._brains), 'brains especializados.')
-        print(n.brain_status())
-    else:
-        # Modo NexusFinal padrão (retrocompatível)
-        n = NexusFinal()
+    # Flags delegadas ao entry point V14 unificado (final do arquivo)
+    _V14_FLAGS = ('--demo', '--lif-demo', '--production')
+    if not any(f in _sys.argv for f in _V14_FLAGS):
+        print('=' * 70)
+        print('NEXUS FINAL + GLOBAL WORKSPACE — Sistema Cognitivo com Multi-Cérebros')
+        print('=' * 70)
 
-    print('\nDigite "sair" para encerrar.')
-    print('Comandos especiais: "status", "saúde", "brains"\n')
-
-    while True:
-        try:
-            user = input('> ').strip()
-        except (EOFError, KeyboardInterrupt):
-            print('\nAté mais!')
-            break
-        if not user:
-            continue
-        if user.lower() in ('sair', 'exit', 'quit'):
-            break
-        if user.lower() == 'brains' and hasattr(n, 'brain_status'):
+        if '--gw' in _sys.argv or '--global' in _sys.argv:
+            # Modo GlobalWorkspace interativo
+            print('\nIniciando com Área de Trabalho Global (multi-brain)...')
+            n = GlobalWorkspaceNexus()
+            print('GlobalWorkspace ativo com', len(n._brains), 'brains especializados.')
             print(n.brain_status())
-        elif user.lower() in ('saúde', 'saude', 'health'):
-            print(n.scan_health())
         else:
-            print(n.chat(user))
+            # Modo NexusFinal padrão (retrocompatível)
+            n = NexusFinal()
+
+        print('\nDigite "sair" para encerrar.')
+        print('Comandos especiais: "status", "saúde", "brains"\n')
+
+        while True:
+            try:
+                user = input('> ').strip()
+            except (EOFError, KeyboardInterrupt):
+                print('\nAté mais!')
+                break
+            if not user:
+                continue
+            if user.lower() == 'brains' and hasattr(n, 'brain_status'):
+                print(n.brain_status())
+            elif user.lower() in ('saúde', 'saude', 'health'):
+                print(n.scan_health())
+            else:
+                print(n.chat(user))
 
 
 
@@ -10443,16 +10992,17 @@ class SemanticSDREncoderFast:
     Mesma semântica do SemanticSDREncoder original, mas usa mat_vec_topk.
     """
     
-    SDR_SIZE = 4096
-    ACTIVE = 40
+    SDR_SIZE = 10000   # espaço HDC global (N = 10.000 bits)
+    ACTIVE = 60        # 60 bits ativos → esparsidade 0,6%
 
     def __init__(self, embed_dim=768):
         self.dim = embed_dim
         self._updates = 0
         if HAS_NUMPY:
             # Gera matriz de projeção diretamente como numpy array
+            # (float32: 10.000×768×4 ≈ 30 MB)
             rng = _np.random.RandomState(42)
-            R = rng.randn(self.SDR_SIZE, embed_dim)
+            R = rng.randn(self.SDR_SIZE, embed_dim).astype(_np.float32)
             norms = _np.linalg.norm(R, axis=1, keepdims=True)
             norms[norms < 1e-9] = 1.0
             self._R_np = R / norms
@@ -10462,13 +11012,13 @@ class SemanticSDREncoderFast:
             self._R = []
             for i in range(self.SDR_SIZE):
                 seed = (i * 6364136223846793005 + 1442695040888963407) & 0xFFFFFFFF
-                v = []
+                vals = []
                 for _ in range(embed_dim):
                     seed = (seed * 1664525 + 1013904223) & 0xFFFFFFFF
                     u = max(seed / 0xFFFFFFFF, 1e-9)
-                    v.append(math.log(u))
-                nrm = math.sqrt(sum(x * x for x in v)) or 1.0
-                self._R.append([x / nrm for x in v])
+                    vals.append(math.log(u))
+                nrm = math.sqrt(sum(x * x for x in vals)) or 1.0
+                self._R.append(array.array('f', [x / nrm for x in vals]))
 
     def encode(self, embed_vec, learn=False):
         if HAS_NUMPY:
@@ -10863,7 +11413,8 @@ class ShapeFeature(FeatureExtractor):
 
 class VisualEncoder:
     """
-    Converte imagem (RGB) em SDR de 40 bits ativos em 4096 bits.
+    Converte imagem (RGB) em SDR de 60 bits ativos em 10.000 bits
+    (esparsidade 0,6% — janela neocortical).
     
     Pipeline:
       image (list[list[tuple(r,g,b)]]) → 5 features (8D cada) → 
@@ -10873,8 +11424,8 @@ class VisualEncoder:
     Numpy acelerado quando disponível (~5× speedup no Sobel).
     """
 
-    SDR_SIZE = 4096
-    ACTIVE_BITS = 40
+    SDR_SIZE = 10000   # espaço HDC global (N = 10.000 bits)
+    ACTIVE_BITS = 60   # 60 bits ativos → esparsidade 0,6%
 
     def __init__(self):
         self.features = [
@@ -11066,7 +11617,8 @@ class VoiceMusicFeature(AudioFeatureExtractor):
 
 class AudioEncoder:
     """
-    Converte áudio (samples float) em SDR de 40 bits ativos em 4096 bits.
+    Converte áudio (samples float) em SDR de 60 bits ativos em 10.000 bits
+    (esparsidade 0,6% — janela neocortical).
     
     Pipeline:
       samples (list[float] -1..1) → 6 features → hash → 40 bits → SparseSDR
@@ -11075,8 +11627,8 @@ class AudioEncoder:
     Numpy acelerado quando disponível (~10× speedup na FFT).
     """
 
-    SDR_SIZE = 4096
-    ACTIVE_BITS = 40
+    SDR_SIZE = 10000   # espaço HDC global (N = 10.000 bits)
+    ACTIVE_BITS = 60   # 60 bits ativos → esparsidade 0,6%
 
     def __init__(self):
         self.features = [
@@ -11290,9 +11842,9 @@ DB_SECURE    = "nexus_secure.db"       # logs de segurança (dados cifrados)
 DB_IOT       = "nexus_iot_final.db"    # telemetria de sensores
 
 # Limites SDR para filtragem de pacotes (Resiliência Seletiva)
-SDR_SPARSITY_MIN  = 0.005   # mínimo 0.5% de bits ativos
-SDR_SPARSITY_MAX  = 0.08    # máximo 8% de bits ativos (ideal: 2%)
-SDR_SPARSITY_IDEAL = 0.02
+SDR_SPARSITY_MIN  = 0.003   # mínimo 0.3% de bits ativos
+SDR_SPARSITY_MAX  = 0.05    # máximo 5% de bits ativos (janela neocortical)
+SDR_SPARSITY_IDEAL = 0.006  # 60/10.000 = 0.6% (esparsidade do neocórtex)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # §2  NEXUS GUARD V11 — Criptografia XOR com SDR-Key Determinística
@@ -11315,8 +11867,15 @@ class NexusGuardV11:
     KEY_SIZE = 256  # bytes — 256 bytes = chave longa para XOR rolling
 
     def __init__(self, key_seed: int = 0x4E455855):  # "NEXU" em hex
-        rng = np.random.RandomState(key_seed)
-        self.master_key: bytes = rng.bytes(self.KEY_SIZE)
+        if HAS_NUMPY:
+            rng = _np.random.RandomState(key_seed)
+            self.master_key: bytes = rng.bytes(self.KEY_SIZE)
+        else:
+            # Fallback Python puro: Mersenne Twister determinístico por seed
+            # (chave difere da via numpy, mas é reproduzível no mesmo modo)
+            _rng = random.Random(key_seed)
+            self.master_key = bytes(_rng.randrange(256)
+                                    for _ in range(self.KEY_SIZE))
         self._hmac_secret: bytes = hashlib.sha256(self.master_key).digest()
 
     # ── Criptografia XOR ──────────────────────────────────────────────────────
@@ -11383,7 +11942,7 @@ class NexusSDRFilter:
     biológico de ~2%), aplica 'Inibição Lateral' (bloqueio) e registra
     como tentativa de intrusão no log de segurança.
 
-    Referência: SDR ideal = 2% ativo = 80/4096 bits
+    Referência: SDR ideal = 0,6% ativo = 60/10.000 bits (neocórtex)
     """
 
     def __init__(self, sdr_size: int = SDR_SIZE,
@@ -11393,39 +11952,61 @@ class NexusSDRFilter:
         self.min_sparsity = min_sparsity
         self.max_sparsity = max_sparsity
         # Máscara SDR mestra: padrão esparso de referência (gerado deterministicamente)
-        rng = np.random.RandomState(SDR_SEED)
-        active_bits = rng.choice(sdr_size, size=SDR_ACTIVE, replace=False)
-        self._master_mask = np.zeros(sdr_size, dtype=np.uint8)
-        self._master_mask[active_bits] = 1
+        if HAS_NUMPY:
+            rng = _np.random.RandomState(SDR_SEED)
+            active_bits = rng.choice(sdr_size, size=SDR_ACTIVE, replace=False)
+            self._master_mask = _np.zeros(sdr_size, dtype=_np.uint8)
+            self._master_mask[active_bits] = 1
+            self._master_active = frozenset(int(b) for b in active_bits)
+        else:
+            # Fallback Python puro: máscara como conjunto de índices ativos
+            self._master_mask = None
+            self._master_active = frozenset(
+                random.Random(SDR_SEED).sample(range(sdr_size), SDR_ACTIVE))
         # Estatísticas
         self._total_packets   = 0
         self._blocked_packets = 0
         self._intrusions: List[Dict] = []
 
-    def compute_sparsity(self, data: Any) -> Tuple[float, np.ndarray]:
+    def compute_sparsity(self, data: Any) -> Tuple[float, Any]:
         """
         Calcula a densidade de bits de um pacote de entrada.
-        Retorna (sparsity, bit_vector).
+        Retorna (sparsity, bit_vector). Com numpy → ndarray denso;
+        sem numpy → conjunto de índices ativos (mesma semântica esparssa).
         """
+        if HAS_NUMPY:
+            if isinstance(data, SparseSDR):
+                vec = data.to_numpy()
+            elif isinstance(data, _np.ndarray):
+                vec = (data > 0).astype(_np.uint8)
+                if len(vec) != self.sdr_size:
+                    # Redimensiona via hash deterministico
+                    padded = _np.zeros(self.sdr_size, dtype=_np.uint8)
+                    n = min(len(vec), self.sdr_size)
+                    padded[:n] = vec[:n]
+                    vec = padded
+            else:
+                # Converte texto/bytes em vetor de bits via hash deterministico
+                raw = data.encode("utf-8") if isinstance(data, str) else str(data).encode()
+                vec = _np.zeros(self.sdr_size, dtype=_np.uint8)
+                for i, b in enumerate(raw[:self.sdr_size]):
+                    vec[int(hashlib.md5(f"{b}{i}".encode()).hexdigest(), 16) % self.sdr_size] = 1
+            active = int(_np.sum(vec))
+            return active / self.sdr_size, vec
+
+        # ── Fallback Python puro (vetor esparso = conjunto de índices) ──
         if isinstance(data, SparseSDR):
-            vec = data.to_numpy()
-        elif isinstance(data, np.ndarray):
-            vec = (data > 0).astype(np.uint8)
-            if len(vec) != self.sdr_size:
-                # Redimensiona via hash deterministico
-                padded = np.zeros(self.sdr_size, dtype=np.uint8)
-                n = min(len(vec), self.sdr_size)
-                padded[:n] = vec[:n]
-                vec = padded
+            active_set = set(data.to_list())
+        elif isinstance(data, (list, tuple, set, frozenset)):
+            active_set = {int(i) for i in data
+                          if 0 <= int(i) < self.sdr_size}
         else:
-            # Converte texto/bytes em vetor de bits via hash deterministico
             raw = data.encode("utf-8") if isinstance(data, str) else str(data).encode()
-            vec = np.zeros(self.sdr_size, dtype=np.uint8)
-            for i, b in enumerate(raw[:self.sdr_size]):
-                vec[int(hashlib.md5(f"{b}{i}".encode()).hexdigest(), 16) % self.sdr_size] = 1
-        active = int(np.sum(vec))
-        sparsity = active / self.sdr_size
-        return sparsity, vec
+            active_set = {
+                int(hashlib.md5(f"{b}{i}".encode()).hexdigest(), 16) % self.sdr_size
+                for i, b in enumerate(raw[:self.sdr_size])
+            }
+        return len(active_set) / self.sdr_size, active_set
 
     def validate_packet(self, data: Any, source_id: str = "unknown") -> Tuple[bool, str]:
         """
@@ -11442,7 +12023,10 @@ class NexusSDRFilter:
             return self._lateral_inhibition(source_id, sparsity, "sparsity_out_of_range")
 
         # Verifica sobreposição mínima com a máscara SDR mestra
-        overlap = float(np.sum(vec & self._master_mask)) / max(SDR_ACTIVE, 1)
+        if HAS_NUMPY:
+            overlap = float(_np.sum(vec & self._master_mask)) / max(SDR_ACTIVE, 1)
+        else:
+            overlap = len(set(vec) & self._master_active) / max(SDR_ACTIVE, 1)
         if overlap < 0.01:  # menos de 1% de sobreposição com o padrão SDR
             return self._lateral_inhibition(source_id, sparsity, "sdr_mask_mismatch")
 
@@ -12567,6 +13151,8 @@ class NexusV14Unified:
             print(f"╔══════════════════════════════════════════╗")
             print(f"║  NEXUS V14 UNIFIED — Sistema Carregado   ║")
             print(f"╠══════════════════════════════════════════╣")
+            print(f"║  SDR       : {SDR_SIZE} bits, {SDR_ACTIVE} ativos ({SDR_ACTIVE / SDR_SIZE * 100:.1f}%)")
+            print(f"║  Córtex LIF: {self.cognitive._core.spiking_cortex.num_neurons} neurônios spiking       ║")
             print(f"║  Cognitivo : V10 Ultimate (ativo)        ║")
             print(f"║  Produção  : V11.2 ({'ativo' if production else 'standby':>7})          ║")
             print(f"║  Sensorial : V13 ({'ativo' if self._sensory_ok else 'N/A':>5})              ║")
@@ -12583,6 +13169,19 @@ class NexusV14Unified:
     def chat(self, text: str) -> str:
         """Interface conversacional principal (V10 GlobalWorkspace)."""
         return self.cognitive.chat(text)
+
+    def perceive(self, text: str, steps: int = 3) -> Dict:
+        """Percepção no córtex spiking LIF (10.000 bits, 60 ativos).
+
+        O estímulo é codificado em SDR e apresentado à população de
+        neurônios Leaky Integrate-and-Fire: integração → leak → disparo
+        → refratário → plasticidade Hebbiana.
+        """
+        return self.cognitive.perceive(text, steps=steps)
+
+    def stimulate(self, sdr, steps: int = 1) -> List[List[int]]:
+        """Estimula o córtex diretamente com um SparseSDR (baixo nível)."""
+        return self.cognitive._core.spiking_cortex.present(sdr, steps=steps)
     
     def learn(self, fact: str, domain: str = "general") -> str:
         """Aprende um fato (V10 + propagação cross-domain)."""
@@ -12763,9 +13362,11 @@ def run_v14_selftest(verbose: bool = True) -> bool:
     
     # 3. SDR Filter
     if verbose: print('\n[3] SDR Filter')
-    sdr = SparseSDR(list(range(0, 160, 2)))  # 80 bits ativos = 2% sparsity
+    # SDR canônico: 60 bits ativos (0,6%) incluindo 1 bit da máscara mestra
+    master_bit = sorted(n.sdr_filter._master_active)[0]
+    sdr = SparseSDR([master_bit] + [i for i in range(1, 120, 2)][:59])
     accepted, msg = n.sdr_filter.validate_packet(sdr, "test")
-    chk('SDR válido aceito', accepted, msg[:50])
+    chk('SDR válido aceito (60 bits, 0,6%)', accepted, msg[:50])
     
     # 4. Sensorial
     if verbose: print('\n[4] Encoders Sensoriais')
@@ -12785,6 +13386,17 @@ def run_v14_selftest(verbose: bool = True) -> bool:
     chk('numpy disponível', HAS_NUMPY == (np is not None), 
         f'numpy={"sim" if HAS_NUMPY else "não"}')
     chk('VecOps.dot()', abs(VecOps.dot([1,2,3],[4,5,6]) - 32.0) < 0.01)
+    
+    # 6. Córtex spiking (LIF + Hebbiano + refratário)
+    if verbose: print('\n[6] Córtex Spiking LIF')
+    rep = n.perceive('neurônio dispara potencial de ação', steps=3)
+    chk('perceive() dispara população LIF',
+        rep.get('spikes_total', 0) > 0,
+        f"spikes={rep.get('spikes_total')} bits={rep.get('sdr_active_bits')}")
+    cs = n.cognitive._core.spiking_cortex.stats
+    chk('Hebbiano consolida sinapses',
+        cs.get('consolidated_synapses', 0) > 0,
+        f"{cs.get('consolidated_synapses')} sinapses")
     
     elapsed = time.time() - t0
     pct = ok/total if total else 0
@@ -12826,6 +13438,10 @@ if __name__ == '__main__':
     elif '--demo' in _sys.argv:
         n = NexusV14Unified(verbose=True)
         asyncio.run(n.run_full_demo())
+    
+    elif '--lif-demo' in _sys.argv:
+        # Simulação do córtex spiking: SDR 10.000 bits + neurônios LIF
+        demo_spiking_cortex(verbose=True)
     
     elif '--production' in _sys.argv:
         # Modo produção com kernel V11.2
