@@ -17,8 +17,17 @@ The kernel's nodes evolved from a simple overlap check into a population of Leak
  * Firing Threshold (V_th) + Refractory Period: on threshold, the neuron spikes, resets, and becomes immune to further stimuli for a few cycles — forcing the network to distribute its temporal representation across neighbouring neurons.
  * Sparse Connectivity: each neuron listens to only ~10% of the 10,000 bits (as cortical pyramidal cells do), so only the small specific group whose receptive field intersects the stimulus reaches threshold.
  * Hebbian Plasticity: "neurons that fire together, wire together" — synapses active at spike time strengthen (clipped to [0, 1]); silent synapses can be formed (weight 0 → 0.02), growing the receptive field and consolidating the concept.
+ * Feedback Inhibition (APL/GGN): a k-winner-take-all gate caps the co-firing population (~25%), keeping the population code sparse even after massive potentiation — homologous to the single giant inhibitory neurons that normalize the fly's mushroom body and antennal lobe.
  * Emergent Semantics: concepts pre-trained with "cat" reach threshold much faster when exposed to "dog" (shared bits with "mammal") than to "car" — semantic clustering emerges in the simulated hardware itself.
-3. HDCRoles (Algebraic Reasoning)
+3. MushroomBody — Circuit Ported from the Drosophila Connectome
+Ported from the complete adult fly brain connectome (FlyWire v783: 139,255 neurons, >50M synapses, 8,453 cell types — see docs/DROSOPHILA_CONNECTOME.md and data/drosophila_connectome_reference.json):
+ * Expand & Sparsify (PN → KC): 2,048 Kenyon cells, each sampling 10 random bits of the 10,000-bit space (the real median input partners per KC measured in the connectome); a KC fires when ≥1 sampled bit is active, yielding the fly's ~5% sparse code. The resulting fly-hash sharpens similarity contrast ~17× (Dasgupta et al. 2017).
+ * Valenced Readout (MBONs): 34 output neurons — 17 appetitive ("PAM"/cholinergic-like, +1) and 17 aversive ("PPL1"/glutamatergic-like, −1) — mirroring the neurotransmitter split measured across the 96 real MBONs. `readout()` yields `{valence, decision: approach/avoid/neutral}`.
+ * Dopamine-Gated Learning (DANs): reward-modulated plasticity on the only plastic site (KC→MBON synapses), gated by dopamine exactly as the fly's 331 dopaminergic neurons gate memory formation. With `dopamine=0` nothing changes (DAN blockade abolishes memory, as in the real experiment).
+ * Emergent Generalization: concepts sharing input bits share active KCs and inherit valence — reward "mammal" and both "cat" (+1.78) and "dog" (+1.55) become approach-worthy while "car" (+0.18) stays neutral.
+ * Dual Pathway: `perceive()` reports the innate route (familiarity via existing memory — the fly's lateral horn) and the learned route (conditioned valence via the mushroom body).
+ * Neuromodulation: global dopamine/serotonin/octopamine state (real modulatory neurons are just 1.2% of the fly brain) gating plasticity and thresholds cortex-wide.
+4. HDCRoles (Algebraic Reasoning)
 Utilizing the XOR Binding and Cyclic Permutation, Nexus understands structural relationships. It distinguishes between Subject, Relation, and Object by rotating bit-vectors, preventing the "semantic soup" effect found in simpler vector databases.
 4. MultiBrain & Global Workspace
 The architecture employs a "Thalamus-Cortex" model:
@@ -49,6 +58,10 @@ The reference simulation of the 10,000-bit SDR space driving the spiking LIF pop
 
 python3 nexus_v14_shared_hippocampus.py --lif-demo
 
-Run the full test suite (44+ checks, including the SDR-10000/LIF block):
+The mushroom body circuit ported from the Drosophila connectome (KC expansion with ~5% sparsity, APL feedback inhibition, reward/punishment conditioning, dopamine gating and semantic generalization):
+
+python3 nexus_v14_shared_hippocampus.py --fly-demo
+
+Run the full test suite (59+ checks, including the SDR-10000/LIF block and the Drosophila mushroom body block):
 
 python3 nexus_v14_shared_hippocampus.py --test

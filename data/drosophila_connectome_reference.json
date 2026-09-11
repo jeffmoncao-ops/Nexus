@@ -1,0 +1,84 @@
+{
+  "_provenance": {
+    "description": "Estatísticas destiladas do conectoma completo do cérebro adulto da Drosophila melanogaster (mosca-da-fruta), medidas a partir dos dados públicos do FlyWire para uso como referência biológica do kernel Nexus.",
+    "dataset": "FlyWire — Female Adult Fly Brain (FAFB), v783",
+    "papers": [
+      "Dorkenwald et al. 2024, Nature — conectoma completo do cérebro adulto (FlyWire)",
+      "Schlegel et al. 2024, Nature s41586-024-07686-5 — anotação whole-brain e cell typing multi-conectoma",
+      "Li et al. 2020, eLife 26975 — conectoma do corpo cogumelar (hemibrain)",
+      "Aso & Rubin 2016; Aso et al. 2014, eLife — MBONs, DANs e compartimentos do corpo cogumelar",
+      "Rubin & Aso 2023, eLife 90523 — 35 tipos de MBON (21 típicos + 14 atípicos)",
+      "Dasgupta et al. 2017, Science — algoritmo neural da mosca para busca de similaridade (expansão + WTA)",
+      "Winding et al. 2023, Science — conectoma larval completo (3.016 neurônios)"
+    ],
+    "data_files_analyzed": [
+      "classification.csv — 139.255 neurônios com classe/superclasse/subclasse/lado",
+      "neurons.csv — 139.255 neurônios com predição de neurotransmissor (ACH/GABA/GLUT/DA/SER/OCT)",
+      "connections.csv — 3.869.878 pares pré→pós com neuropilo, contagem de sinapses e neurotransmissor"
+    ],
+    "access": "Download público via codex.flywire.ai (FlyWire Consortium, Princeton Neuroscience Institute); espelho verificado: github.com/snedea/flybrain (arquivos originais do Codex)",
+    "license": "CC-BY-4.0 (FlyWire)",
+    "measured_at": "2026-09-11",
+    "note": "Contagens de sinapses deste arquivo referem-se à soma da coluna syn_count da tabela de conexões (34,15 milhões em 3,87 milhões de pares). A contagem total publicada do conectoma é >50 milhões de sinapses (inclui todas as vias)."
+  },
+  "global": {
+    "neurons": 139255,
+    "connection_pairs": 3869878,
+    "synapses_in_connection_table": 34153566,
+    "cell_types_annotated": 8453,
+    "new_cell_types": 4581,
+    "neuropils": 123,
+    "flow": { "intrinsic": 118464, "afferent": 19300, "efferent": 1491 },
+    "super_class_top": { "optic": 77873, "central": 32381, "sensory": 16938, "visual_projection": 7684, "ascending": 1750, "descending": 1305, "motor": 110 },
+    "vision_dominance_fraction": 0.558,
+    "left_right": { "left": 69959, "right": 69093, "center": 173 }
+  },
+  "connectivity": {
+    "synapses_per_connection": { "median": 6, "mean": 8.8, "p90": 17, "p99": 56, "max": 2405 },
+    "out_degree": { "mean": 29.9, "median": 15, "p99": 259, "max": 12896 },
+    "in_degree": { "mean": 30.9, "median": 12, "p99": 309, "max": 13826 },
+    "reciprocity_fraction": 0.098,
+    "top1pct_input_hubs_capture_fraction": 0.194
+  },
+  "neurotransmitters": {
+    "ACH": 82298, "ACH_pct": 59.10,
+    "GLUT": 19605, "GLUT_pct": 14.08,
+    "GABA": 16017, "GABA_pct": 11.50,
+    "SER": 1021, "SER_pct": 0.73,
+    "DA": 584, "DA_pct": 0.42,
+    "OCT": 72, "OCT_pct": 0.05,
+    "note": "Categorias vazias: 19.658 (sem predição). Moduladores (DA+SER+OCT) = 1.677 neurônios = 1,2% do cérebro — poucos neurônios, efeito global."
+  },
+  "mushroom_body": {
+    "kenyon_cells_total": 5177,
+    "kenyon_cells_per_hemisphere": 2588,
+    "kc_input_partners_per_kc": { "mean": 10.9, "median": 10, "p90": 14 },
+    "kc_output_partners_per_kc": { "mean": 17.9, "median": 17 },
+    "kc_input_synapses_per_kc": { "mean": 89.3, "median": 89 },
+    "kc_main_input_classes": { "MBIN": 25539, "ALPN": 21768, "Kenyon_Cell": 5427, "DAN": 581 },
+    "kc_main_output_classes": { "MBIN": 45050, "MBON": 38915, "DAN": 3312 },
+    "mbon_cells": 96,
+    "mbon_by_neurotransmitter": { "ACH": 51, "GLUT": 23, "GABA": 17 },
+    "dan_cells": 331,
+    "apl_neuron": {
+      "description": "APL (anterior paired lateral) — neurônio inibitório GABAérgico gigante, 1 por hemisfério, feedback global de inibição sobre os KCs",
+      "kc_synapses_received_per_hemisphere": 13402
+    },
+    "antennal_lobe_pns": 685,
+    "expansion_ratio_kc_per_pn_hemisphere": 7.6,
+    "kcs_reached_by_median_pn": 60,
+    "kcs_reached_by_median_pn_fraction": 0.012,
+    "kc_activity_sparsity_biological": 0.05,
+    "lateral_horn_central_neurons": 42,
+    "compartments_alpha_lobe": 16,
+    "mbon_types_literature": 35
+  },
+  "design_principles_for_nexus": {
+    "expand_and_sparsify": "PN→KC: projeção aleatória esparssa + expansão ~8× + inibição por feedback (APL) → código de ~5% ativo. Dasgupta 2017 mostra que isso supera LSH para busca de similaridade.",
+    "dual_pathway": "Mesma entrada sensorial → via inata (lobo lateral, rápida e fixa) E via aprendida (corpo cogumelar, plástica). Mapeado no Nexus: familiaridade por memória (inata) + valência aprendida (MB).",
+    "few_global_teachers": "Aprendizado KC→MBON é modulado por apenas 331 DANs (0,24% dos neurônios): dopamina porta a plasticidade (PAM=recompensa, PPL1=punição).",
+    "feedback_inhibition_keeps_sparse": "APL/GGN (1 neurônio inibitório por estrutura) normalizam globalmente a atividade → k-winner-take-all. Aplicado ao SpikingCortex para manter o código populacional esparso.",
+    "valence_readout": "MBONs de neurotransmissores distintos codificam valências opostas (GLUT=aversiva, ACH=apetitiva); a decisão (aproximar/evitar) emerge da soma das valências.",
+    "recurrence": "9,8% das conexões têm aresta reversa; KC→DAN→KC forma laços de predição de recompensa. Laços aninhados são a base da flexibilidade temporal."
+  }
+}
