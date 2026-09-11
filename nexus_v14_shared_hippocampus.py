@@ -8469,6 +8469,8 @@ class NexusV10:
         # V14.5: estímulos reforçados (texto, SDR) — fonte auditável da
         # generalização do corpo cogumelar nas respostas
         self._reinforced: List[Tuple[str, 'SparseSDR']] = []
+        # V14.7: novidade do último turno (sinal para a dopamina de curiosidade)
+        self._last_novelty: float = 0.0
         # BeamGenerator: geração com beam search + reranking
         self.beam_gen = BeamGenerator(self.ngram, self.embed)
         # AttentionPool: IDF-weighted sentence vectors
@@ -8934,6 +8936,34 @@ class NexusV10:
                         key=lambda a: (-a['similarity'], a['stimulus']))
         return scored[:k]
 
+    def _fly_tie_break(self, rer: List[Tuple[float, str]]) -> List[Tuple[float, str]]:
+        """V14.7: voto da mosca — desempate afetivo na seleção da resposta.
+
+        Entre candidatos com relevância praticamente empatada (Δcosseno
+        < 0.03), o corpo cogumelar prefere o tema associado a estímulos
+        reforçados. O bônus é pequeno (≤ 0.025·sim·valência, teto < 0.03)
+        e só se aplica ao grupo de empate — NUNCA promove um candidato
+        claramente pior; apenas opiniona quando a recuperação está em
+       patamar técnico. É a mosca participando da escolha da resposta.
+        """
+        if len(rer) < 2 or not getattr(self, '_reinforced', None):
+            return rer
+        top = rer[0][0]
+        out: List[Tuple[float, str]] = []
+        for cs, ct in rer:
+            if top - cs < 0.03 and cs >= 0.35:
+                try:
+                    assoc = self.fly_associations(ct, k=1)
+                except Exception:
+                    assoc = []
+                if assoc:
+                    a = assoc[0]
+                    v = max(-1.0, min(1.0, a['valence']))
+                    cs = cs + 0.025 * a['similarity'] * v
+            out.append((cs, ct))
+        out.sort(key=lambda x: (-x[0], x[1]))
+        return out
+
     def imagine(self, seed_text: str, steps: int = 3) -> List[Dict]:
         """Corrente de pensamento: rola a predição de estados a partir de um texto.
 
@@ -9070,6 +9100,7 @@ class NexusV10:
         
         # V10: Novelty detection — inputs novos reforçam aprendizado
         novelty_score = self.novelty.update(sdr)
+        self._last_novelty = novelty_score   # V14.7: sinal de curiosidade
         if novelty_score > 0.7:
             self.homeostasis.on_novel_input()
             # Boost de surpresa: amplifica bits raros no SDR
@@ -9932,7 +9963,22 @@ class NexusV10:
             return self.mouth.speak_contradiction_ask(old_text, text)
 
         # ── Sem contradição: armazenar em todas as camadas ───────────────────
-        return self._store_learned(text, sdr)
+        result = self._store_learned(text, sdr)
+
+        # V14.7: DOPAMINA DE CURIOSIDADE — a mosca decide o que vale
+        # aprender. Fatos surpreendentes (novidade ≥ 0.7) recebem reforço
+        # proporcional: viram memória afetiva (valência), marcam a trajetória
+        # de estados e ganham voz na resposta (nota de associação + voto no
+        # desempate). Fatos comuns não consomem dopamina — seleção natural
+        # do interesse, como a mosca prioriza o que vale memorizar.
+        _nov = getattr(self, '_last_novelty', 0.0) or 0.0
+        if (_nov >= 0.70 and '[dedup]' not in result.lower()
+                and '[inconsist' not in result.lower()):
+            try:
+                self.reinforce(text, 1.0 if _nov >= 0.85 else 0.4)
+            except Exception:
+                pass
+        return result
 
     def _store_learned(self, text: str, sdr: SparseSDR) -> str:
         """Persiste um fato validado (sem contradição) em todas as camadas."""
@@ -10736,6 +10782,7 @@ class NexusV10:
                         _rer.append((sum(x * y for x, y in zip(qv, _cv))
                                      / (_nqv * _ncv), _c))
                     _rer.sort(key=lambda x: (-x[0], x[1]))
+                    _rer = self._fly_tie_break(_rer)   # V14.7: voto da mosca
                     if _rer and _rer[0][0] >= 0.35:
                         _extra_g = ''
                         if len(_rer) > 1 and _rer[1][0] >= 0.35:
@@ -11032,6 +11079,7 @@ class NexusV10:
             self._semantic_backend = 'miniembed-hash'
             self.last_emotion = None
             self._reinforced = []
+            self._last_novelty = 0.0
         # Restaura cada sub-sistema via from_dict
         if 'encoder' in data:
             self.encoder = MultiLobeEncoder.from_dict(data['encoder'])
@@ -12771,6 +12819,40 @@ def run_nexus_tests(verbose: bool = True) -> bool:
         os.unlink('/tmp/nx_v145.json')
     except OSError:
         pass
+
+    # V14.7: dopamina de curiosidade — a mosca decide o que vale aprender
+    n14d = NexusFinal()
+    n14d.disable_autosave()
+    n14d._last_novelty = 0.92   # fato altamente surpreendente
+    n14d._handle_learn('o pulo do rare gato-da-bahia dura tres segundos')
+    chk('Curiosidade reforça fatos surpreendentes (dopamina de novidade)',
+        len(n14d._reinforced) >= 1,
+        f"{len(n14d._reinforced)} estímulo(s) no registro")
+    _val14d = n14d.mushroom_body.readout(
+        n14d.semantic_encode('o pulo do rare gato-da-bahia dura tres segundos')
+    )['valence']
+    chk('Fato curioso ganhou valência positiva (memória afetiva)',
+        _val14d > 0.3, f'valência={_val14d:+.2f}')
+    r14d = n14d.chat('fale sobre o gato-da-bahia')
+    chk('Fato aprendido por curiosidade carrega nota da mosca na resposta',
+        'cogumelar' in (r14d or '') or 'afetiva' in (r14d or ''),
+        ((r14d or '').splitlines()[-1][:50]) if r14d else '')
+    n14d._last_novelty = 0.1    # fato comum: sem dopamina
+    n14d._handle_learn('o papel comum é feito de celulose processada')
+    chk('Fato comum (novidade baixa) NÃO consome dopamina',
+        not any('papel' in t for t, _ in n14d._reinforced),
+        f"{len(n14d._reinforced)} estímulos (inalterado)")
+
+    # V14.7: voto da mosca no desempate da seleção
+    _gdb = 'o pulo do rare gato-da-bahia dura tres segundos'
+    tb_far = n14d._fly_tie_break([(0.60, 'fato A'), (0.40, 'fato B')])
+    chk('Voto da mosca nunca promove candidato claramente pior',
+        tb_far[0][1] == 'fato A')
+    tb_tie = n14d._fly_tie_break(
+        [(0.595, _gdb), (0.600, 'fato sobre pedologia profunda')])
+    chk('Voto da mosca desempata a favor do tema que a interessou',
+        tb_tie[0][1] == _gdb,
+        f'topo: {tb_tie[0][1][:40]!r}')
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # RESULTADO FINAL

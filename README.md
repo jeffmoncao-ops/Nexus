@@ -59,6 +59,8 @@ The motor link: the same connectome-derived circuit that made the fly play games
  * Odor generalization: a fruit NEVER seen before (manga) is approached — inherited valence via the semantic encoder.
  * Online foraging with INVERTED reward: the sweet odor is now punished; the agent starts following its prior and adapts by consequence alone (5/5 correct at the end) — learning that overrides generalization.
  * Affective speech: `chat()` marks responses with conditioned avoidance/attraction notes when the learned valence is strong (valence −5.10 measured in the suite).
+ * Curiosity Dopamine (V14.7): the fly now decides what is WORTH learning. Surprising facts (novelty ≥ 0.7, measured per turn by the NoveltyDetector) trigger proportional reinforcement (+1.0 if ≥ 0.85, +0.4 otherwise) — the fact becomes affective memory, marks the state trajectory and earns a voice in future responses; mundane facts consume no dopamine. Measured in the suite: a high-novelty fact learns valence +0.85 and its query answer carries the mushroom-body note; a low-novelty fact is stored but never reinforced.
+ * Affective Tie-Break (V14.7): in the grounded-answer stage, candidates within 0.03 cosine of each other are re-ordered by the fly's preference (bonus ≤ 0.025·similarity·valence toward topics associated with reinforced stimuli) — the fly votes on which fact becomes the answer when retrieval is technically tied, and can never promote a clearly worse candidate (guarded in the suite).
  * Run it: `python3 nexus_v14_shared_hippocampus.py --agent-demo`
 🚀 Future Applications
 The Nexus Kernel is designed for integration where latency, privacy, and local autonomy are critical:

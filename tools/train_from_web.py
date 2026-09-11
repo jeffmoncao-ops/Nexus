@@ -119,13 +119,15 @@ def retrieve_eval(kernel, questions):
 
 
 def chat_eval(kernel, questions):
-    """Acurácia ponta-a-ponta: resposta-ouro contida na resposta do chat()."""
+    """Acurácia ponta-a-ponta + participação da mosca na resposta."""
     rows = []
     for q in questions:
         resp = kernel.chat(q['question'])
         gold = norm(q['answer'])
         rows.append({'q': q['question'][:70], 'gold': q['answer'],
                      'ok': gold in norm(resp or ''),
+                     'fly': ('cogumelar' in (resp or '')
+                             or 'memória afetiva' in (resp or '')),
                      'resp': (resp or '')[:90]})
     return rows
 
@@ -204,6 +206,7 @@ def main() -> int:
     sp_hits = sum(r['hit5'] for r in sp_rows)
     chn = len(ch_rows)
     ch_ok = sum(r['ok'] for r in ch_rows)
+    ch_fly = sum(r['fly'] for r in ch_rows)
 
     print('\n┌────────────────────────────────────────────────────────────────┐')
     print('│  RESULTADO — SQuAD v1.1 PT-BR (treino web, one-shot)           │')
@@ -219,7 +222,15 @@ def main() -> int:
     print(f'│    hit@5 : {sp_hits}/{spn} (esperado ~0 — não inventa o que não  ' + ' ' * 4 + '│')
     print(f'│             aprendeu)                                          ' + ' ' * 12 + '│')
     print(f'│  CHAT() ponta-a-ponta ({chn} perguntas): acertos {ch_ok}/{chn}        ' + ' ' * 14 + '│')
+    print(f'│  PARTICIPAÇÃO DA MOSCA: {ch_fly}/{chn} respostas com nota afetiva ' + ' ' * 8 + '│')
     print('└────────────────────────────────────────────────────────────────┘')
+
+    for r in ch_rows:
+        if r['fly']:
+            print('\n  resposta com participação da mosca:')
+            print(f"  {r['q']}")
+            print(f"  {r['resp'][:88]}")
+            break
 
     print('\nexemplos (recall):')
     hit_shown = miss_shown = 0
