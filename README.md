@@ -26,7 +26,8 @@ Ported from the complete adult fly brain connectome (FlyWire v783: 139,255 neuro
  * Dopamine-Gated Learning (DANs): reward-modulated plasticity on the only plastic site (KC→MBON synapses), gated by dopamine exactly as the fly's 331 dopaminergic neurons gate memory formation. With `dopamine=0` nothing changes (DAN blockade abolishes memory, as in the real experiment).
  * Emergent Generalization: concepts sharing input bits share active KCs and inherit valence — reward "mammal" and both "cat" (+1.78) and "dog" (+1.55) become approach-worthy while "car" (+0.18) stays neutral.
  * Dual Pathway: `perceive()` reports the innate route (familiarity via existing memory — the fly's lateral horn) and the learned route (conditioned valence via the mushroom body).
- * Neuromodulation: global dopamine/serotonin/octopamine state (real modulatory neurons are just 1.2% of the fly brain) gating plasticity and thresholds cortex-wide.
+ * Neuromodulation: global dopamine/serotonin/octopamine state (real modulatory neurons are just 1.2% of the fly brain) gating plasticity and thresholds cortex-wide. Since V14.3 this is load-bearing: every chat turn passes the modulatory state into the LIF cortex (`dopamine` raises Hebbian gain, `octopamine` lowers firing threshold — arousal).
+ * Forgetting Curve: during `sleep()`, unreactivated KC→MBON synapses decay and are pruned — valence memories that are never reconsolidated fade, as in the fly.
 5. AssemblySequencer — Autoregression over States (Assembly Sequences)
 Instead of predicting the next token (surface), the kernel predicts the next sparse STATE: SDR_t → SDR_{t+1} — the level at which cortical assembly sequences operate (HTM Temporal Memory; Papadimitriou's Assembly Calculus; Buzsáki's population slot codes):
  * State Transitions: one-shot, gradient-free associative memory of transitions between SDRs (inverted index, O(k) recall); every transition is auditable.
@@ -34,6 +35,8 @@ Instead of predicting the next token (surface), the kernel predicts the next spa
  * Context as Dynamic Glue: a decaying sparse context disambiguates branching futures ("fogo" → water branch or wood branch, depending on where the trajectory has been).
  * State-Space Generalization: an SDR never seen, but close to known predecessors, inherits their plausible futures — new surface, same direction.
  * Surprise as a Learning Signal: prediction error (1 − overlap) is self-supervised novelty; high surprise pulses octopamine (arousal), closing the loop between prediction and neuromodulation.
+ * Dopaminergic Consolidation (V14.3): `reinforce()` marks the recently traversed transitions with a value — rewarded trajectories are preferred in next-state prediction (60/60 vs 0/60 in the test suite), punished ones suppressed. The fly's valence circuit and the state predictor are now one loop.
+ * Forgetting Curve (V14.3): during `sleep()` unrevisited transitions decay exponentially and die; reward-marked trajectories resist forgetting — emotionally salient memories persist.
  * Imagination: `imagine(seed, steps)` rolls predictions forward into a chain of thought, decoded back to text by associative memory recall — and `state_embedding()` exposes the dense per-state vector, the natural slot where a local SLM (BERT/MiniLM) plugs in to ground the trajectories in real semantics.
 6. HDCRoles (Algebraic Reasoning)
 Utilizing the XOR Binding and Cyclic Permutation, Nexus understands structural relationships. It distinguishes between Subject, Relation, and Object by rotating bit-vectors, preventing the "semantic soup" effect found in simpler vector databases.
@@ -74,6 +77,6 @@ The assembly sequencer (state-space autoregression): next-SDR prediction, branch
 
 python3 nexus_v14_shared_hippocampus.py --assembly-demo
 
-Run the full test suite (69+ checks, including the SDR-10000/LIF block, the Drosophila mushroom body block and the assembly sequences block):
+Run the full test suite (75+ checks, including the SDR-10000/LIF block, the Drosophila mushroom body block and the assembly sequences block):
 
 python3 nexus_v14_shared_hippocampus.py --test

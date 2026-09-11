@@ -6385,9 +6385,17 @@ class SpikingCortex:
         """
         return [self.step(input_sdr, learn=learn) for _ in range(steps)]
 
-    def observe(self, input_sdr, label: str = '') -> List[int]:
-        """Um passo de percepção (usado pelo pipeline de chat). Alias de step()."""
-        return self.step(input_sdr, learn=True)
+    def observe(self, input_sdr, label: str = '',
+                modulation: Optional[Tuple[float, float]] = None) -> List[int]:
+        """Um passo de percepção (usado pelo pipeline de chat). Alias de step().
+
+        modulation: estado (dopamina, octopamina) da Neuromodulation —
+        dopamina eleva o ganho Hebbiano, octopamina baixa o limiar de
+        disparo (arousal). O neuromodulado é o cérebro-da-mosca agindo
+        sobre o córtex: POUCOS neurônios, efeito GLOBAL.
+        """
+        self.last_modulation = modulation   # observável (auditoria/testes)
+        return self.step(input_sdr, learn=True, modulation=modulation)
 
     # ── Medição (sem efeitos colaterais) ─────────────────────────────────────
 
@@ -6805,6 +6813,26 @@ class MushroomBody:
                 delta += lr
         return delta
 
+    def forget(self, decay: float = 0.995, floor: float = 0.02) -> int:
+        """Curva de esquecimento sináptica: sinapses não reativadas decaem.
+
+        Sinapses KC→MBON que não forem reconsolidadas (nova associação com
+        dopamina) decaem em direção a zero e são podadas abaixo do piso —
+        memória de valência sem reativação esvanece, como na mosca.
+        Retorna quantas sinapses foram podadas.
+        """
+        dead = 0
+        for kc in list(self.synapses.keys()):
+            syn = self.synapses[kc]
+            for m in list(syn.keys()):
+                syn[m] *= decay
+                if syn[m] < floor:
+                    del syn[m]
+                    dead += 1
+            if not syn:
+                del self.synapses[kc]
+        return dead
+
     # ── Serialização (só o sítio plástico; o calyx é determinístico) ────────
 
     @property
@@ -7072,6 +7100,9 @@ class AssemblySequencer:
 
         # Contexto esparso com decaimento — a "cola" entre transições
         self._ctx_counts: Dict[int, float] = defaultdict(float)
+        # Janela de consolidação: últimas transições percorridas (alvo do
+        # marcamento dopaminérgico em consolidate())
+        self._recent: List[int] = []
 
     # ── Estado → embedding denso (projeção aleatória determinística) ────────
 
@@ -7146,13 +7177,16 @@ class AssemblySequencer:
         if tid is None:
             tid = self._next_id
             self._next_id += 1
-            self._trans[tid] = {'pre': pre, 'post': post, 'count': 1}
+            self._trans[tid] = {'pre': pre, 'post': post,
+                               'count': 1, 'value': 0.0}
             self._pair_idx[key] = tid
             for b in pre:
                 self._bit_idx[b].add(tid)
             self._prune_if_needed()
         else:
             self._trans[tid]['count'] += 1
+        self._recent.append(tid)
+        del self._recent[:-4]   # janela de consolidação (últimas 4)
 
     def _prune_if_needed(self) -> None:
         """Capacidade: poda as transições menos observadas (esquecimento)."""
@@ -7205,6 +7239,12 @@ class AssemblySequencer:
                 continue
             tr = self._trans[tid]
             w = (ov / len(tr['pre'])) * tr['count']
+            # V14.3: valência dopaminérgica da trajetória — recompensa
+            # amplifica o voto, punição suprime (1+(-1)→0.1, nunca negativo)
+            if tr['value'] > 0:
+                w *= (1.0 + 0.5 * tr['value'])
+            elif tr['value'] < 0:
+                w *= max(0.1, 1.0 + tr['value'])
             if ctx:
                 # bônus para ramos coerentes com a trajetória recente
                 w *= (1.0 + self.context_weight
@@ -7260,6 +7300,51 @@ class AssemblySequencer:
                 ctx_counts[b] = ctx_counts.get(b, 0.0) + 1.0
         return chain
 
+    # ── Consolidação dopaminérgica e curva de esquecimento ──────────────────
+
+    def consolidate(self, reward: float, window: int = 4) -> int:
+        """Recompensa/punição marca as transições recentemente percorridas.
+
+        Análogo à consolidação dependente de recompensa (DAN→MB): o valor
+        acumula nas transições da janela recente — positivo = preferência
+        na predição do próximo estado; negativo = supressão. É o elo que
+        soma o circuito de valência da mosca ao sistema de predição.
+        Retorna quantas transições foram marcadas.
+        """
+        n = 0
+        for tid in self._recent[-window:]:
+            tr = self._trans.get(tid)
+            if tr is None:
+                continue
+            tr['value'] = max(-3.0, min(3.0, tr['value'] + reward))
+            n += 1
+        return n
+
+    def forget(self, decay: float = 0.98, floor: float = 0.5) -> int:
+        """Curva de esquecimento: transições não revisitadas decaem e morrem.
+
+        count *= decay a cada ciclo de sono (Ebbinghaus exponencial);
+        transições com count < floor são esquecidas — EXCETO as marcadas
+        por recompensa (value > 0 resiste: memória consolidada emocional/
+        dopaminergicamente é mais durável). Retorna quantas morreram.
+        """
+        dead = [tid for tid, tr in self._trans.items()
+                if tr['count'] * decay < floor and tr['value'] <= 0.0]
+        for tid in dead:
+            tr = self._trans.pop(tid)
+            self._pair_idx.pop((tr['pre'], tr['post']), None)
+            for b in tr['pre']:
+                s = self._bit_idx.get(b)
+                if s is not None:
+                    s.discard(tid)
+                    if not s:
+                        del self._bit_idx[b]
+        for tr in self._trans.values():
+            if tr['value'] <= 0.0:
+                tr['count'] *= decay   # consolidadas mantêm o count
+        self._recent = [t for t in self._recent if t in self._trans]
+        return len(dead)
+
     # ── Serialização ─────────────────────────────────────────────────────────
 
     @property
@@ -7267,6 +7352,8 @@ class AssemblySequencer:
         return {
             'transitions': len(self._trans),
             'observations': sum(t['count'] for t in self._trans.values()),
+            'reward_marked': sum(1 for t in self._trans.values()
+                                 if t['value'] != 0.0),
             'context_bits': len(self._ctx_counts),
             'capacity': self.capacity,
         }
@@ -7279,7 +7366,8 @@ class AssemblySequencer:
             'k_active': self.k_active, 'seed': self.seed,
             'transitions': [{'pre': sorted(t['pre']),
                              'post': sorted(t['post']),
-                             'count': t['count']}
+                             'count': round(t['count'], 4),
+                             'value': round(t.get('value', 0.0), 3)}
                             for t in self._trans.values()],
             'ctx_counts': {str(b): round(c, 4)
                            for b, c in self._ctx_counts.items()},
@@ -7301,7 +7389,8 @@ class AssemblySequencer:
             tid = seq._next_id
             seq._next_id += 1
             seq._trans[tid] = {'pre': pre, 'post': post,
-                               'count': int(t.get('count', 1))}
+                               'count': float(t.get('count', 1)),
+                               'value': float(t.get('value', 0.0))}
             seq._pair_idx[(pre, post)] = tid
             for b in pre:
                 seq._bit_idx[b].add(tid)
@@ -8320,10 +8409,15 @@ class NexusV10:
         sdr = self.semantic_encode(text)
         delta = self.mushroom_body.learn(sdr, reward)
         self.neuromodulation.pulse(dopamine=abs(reward))
+        # V14.3: a recompensa também CONSOLIDA a trajetória de estados
+        # recentemente percorrida — transições marcadas com valor passam a
+        # enviesar a predição do próximo estado (mosca × predição somados)
+        marked = self.assembly.consolidate(reward)
         return {
             'text': text[:60],
             'reward': reward,
             'synaptic_delta': round(delta, 4),
+            'trajectories_marked': marked,
             **self.mushroom_body.readout(sdr),
         }
 
@@ -8470,7 +8564,13 @@ class NexusV10:
 
         # V14: percepção no córtex spiking — o SDR estimula a população LIF
         # (integração → leak → disparo → refratário → potenciação Hebbiana)
-        self.spiking_cortex.observe(sdr, label=text[:40])
+        # V14.3: o estado neuromodulatório da Drosophila modula o córtex —
+        # dopamina eleva o ganho Hebbiano, octopamina baixa o limiar
+        # (arousal). O cérebro-da-mosca agora é load-bearing no pipeline.
+        _nm = self.neuromodulation.state
+        self.spiking_cortex.observe(
+            sdr, label=text[:40],
+            modulation=(_nm['dopamine'], _nm['octopamine']))
 
         # V14.2: AssemblySequencer — predição do próximo ESTADO esparso.
         # Primeiro TESTA (surpresa = erro de predição do estado atual dado o
@@ -8573,6 +8673,11 @@ class NexusV10:
 
         # V10: Temporal memory pruning during sleep
         temporal_pruned = self.temporal.prune(threshold=0.05)
+
+        # V14.3: curva de esquecimento — sinapses KC→MBON e trajetórias de
+        # estados não revisitadas decaem; o que foi recompensado resiste
+        mb_forgotten = self.mushroom_body.forget()
+        asm_forgotten = self.assembly.forget()
         
         # V10: SDR Reasoner auto-generalization from brain memories
         if len(self.brain._memories) > 10:
@@ -8591,6 +8696,8 @@ class NexusV10:
         
         report.metadata = {**graph_prune,
                            'temporal_pruned': temporal_pruned,
+                           'mb_synapses_forgotten': mb_forgotten,
+                           'transitions_forgotten': asm_forgotten,
                            'edges_pruned': pruned,
                            'rules_induced': len(new_rules),
                            'rules_applied': rules_applied,
@@ -11815,6 +11922,40 @@ def run_nexus_tests(verbose: bool = True) -> bool:
         _cos13(e_a, e_a2) > _cos13(e_a, e_d),
         f'{_cos13(e_a, e_a2):.3f} > {_cos13(e_a, e_d):.3f}')
 
+    # V14.3: valência da mosca × predição de estados (consolidação)
+    s_e = create_sdr_with_overlap(seed=205)
+    seq_v = AssemblySequencer()
+    seq_v.observe(s_a, s_b)          # ramo neutro
+    seq_v.observe(s_a, s_e)          # ramo que será recompensado (último)
+    marked13 = seq_v.consolidate(reward=1.0, window=1)
+    pred_v = seq_v.predict(s_a)
+    chk('Recompensa enviesa a predição do próximo estado',
+        marked13 >= 1 and pred_v.overlap_count(s_e) > pred_v.overlap_count(s_b),
+        f"e={pred_v.overlap_count(s_e)}/60 > b={pred_v.overlap_count(s_b)}/60")
+
+    seq_v.observe(s_a, s_b)          # revisita o ramo neutro (fica recente)
+    seq_v.consolidate(reward=-1.0, window=1)   # punição suprime esse ramo
+    pred_p = seq_v.predict(s_a)
+    chk('Punição suprime a trajetória na predição',
+        pred_p.overlap_count(s_e) > pred_p.overlap_count(s_b),
+        f"e={pred_p.overlap_count(s_e)}/60 > b={pred_p.overlap_count(s_b)}/60")
+
+    # V14.3: curva de esquecimento (Ebbinghaus) e proteção por recompensa
+    seq_fg = AssemblySequencer()
+    seq_fg.observe(s_a, s_b)                 # transição comum (count=1)
+    seq_fg.observe(s_c, s_d)                 # transição que será marcada
+    seq_fg.consolidate(reward=2.0, window=1)
+    dead13 = 0
+    for _ in range(40):
+        dead13 += seq_fg.forget(decay=0.5, floor=0.5)
+    chk('Curva de esquecimento: transições não revisitadas morrem',
+        dead13 >= 1 and seq_fg.predict(s_a) is None,
+        f'{dead13} transições esquecidas')
+    chk('Transições recompensadas resistem ao esquecimento',
+        seq_fg.predict(s_c) is not None
+        and seq_fg.predict(s_c).overlap_count(s_d) >= 50,
+        f"{seq_fg.stats['transitions']} sobreviveram")
+
     # Serialização: trajetórias sobrevivem ao round-trip
     seq_r13 = AssemblySequencer.from_dict(seq13.to_dict())
     chk('Serialização preserva transições',
@@ -11835,6 +11976,22 @@ def run_nexus_tests(verbose: bool = True) -> bool:
         f"recall='{(thoughts13[0]['recall'] or '')[:40] if thoughts13 else ''}'")
     chk('Predição no pipeline não afeta as respostas do chat',
         isinstance(n13.chat('o que é fogo?'), str))
+
+    # V14.3: mosca load-bearing — modulação do córtex + consolidação no pipeline
+    n13b = NexusFinal()
+    n13b.disable_autosave()
+    n13b.chat('aprenda: luz acesa gera calor')
+    n13b.chat('aprenda: o calor derrete a cera')
+    rr13b = n13b.reinforce('aprenda: o calor derrete a cera', reward=1.0)
+    chk('reinforce() consolida trajetórias de estado (marcadas por valor)',
+        rr13b.get('trajectories_marked', 0) >= 1
+        and n13b.assembly.stats.get('reward_marked', 0) >= 1,
+        f"{n13b.assembly.stats.get('reward_marked', 0)} marcadas")
+    n13b.chat('a chama é uma luz acesa')
+    _lm = n13b.spiking_cortex.last_modulation
+    chk('Neuromodulação (Drosophila) modula o córtex LIF no pipeline',
+        _lm is not None and _lm[0] > 0.0,
+        f'modulação (DA, OCT)={_lm}')
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # RESULTADO FINAL
