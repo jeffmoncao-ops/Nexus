@@ -216,6 +216,32 @@ def _deaccent(s: str) -> str:
                    if unicodedata.category(c) != 'Mn')
 
 
+_PT_SUFFIXES = (
+    'mente',                       # advérbios: 'oficialmente' → 'oficial'
+    'aram', 'eram', 'iram', 'avam', 'iam', 'ando', 'endo', 'indo',
+    'acao', 'coes', 'oes', 'ou', 'ar', 'er', 'ir', 'es', 'as', 'os',
+    'a', 'o', 'e', 's',
+)
+
+
+def _stem_pt(w: str) -> str:
+    """V14.10: stemmer PT minimalista — só o bastante para casar flexão.
+
+    'matou' → 'mat', 'mataram' → 'mat'; 'cultiva' → 'cultiv',
+    'cultivar' → 'cultiv'. Radicais de ≥3 chars; sem dicionário.
+    """
+    for suf in _PT_SUFFIXES:
+        if w.endswith(suf) and len(w) - len(suf) >= 3:
+            return w[:len(w) - len(suf)]
+    return w
+
+
+def _content_stems(text: str) -> set:
+    """Palavras-núcleo (≥4 chars, sem stopwords) reduzidas a radicais."""
+    return {_stem_pt(w) for w in re.findall(r'[a-zà-ÿ]{4,}',
+                                            _deaccent(text.lower()))}
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # §1  SPARSE SDR — v5 Pro (array('H'), 25× mais compacto)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -729,7 +755,15 @@ class MiniEmbed:
             vec.append(u)
         norm = math.sqrt(sum(x*x for x in vec)) or 1.0
         result = [x/norm for x in vec]
-        MiniEmbed._rand_vec_cache[word] = result
+        cache = MiniEmbed._rand_vec_cache
+        cache[word] = result
+        # V14.10: teto FIFO — o cache crescia ~4 MB/parágrafo (char
+        # n-grams de cada palavra) e o treino de artigos inteiros
+        # estourava a RAM (processo morto no artigo 3, 2×). Vetores são
+        # determinísticos (hash-seed): evictar só força recomputar.
+        if len(cache) > 8192:
+            for k in list(cache.keys())[:4096]:
+                del cache[k]
         return result
 
     # ── Subword char n-grams ────────────────────────────────────────────────────
@@ -997,6 +1031,23 @@ class MiniEmbed:
 
         self._sv_version += 1
         self._vec_cache.clear()   # drift/subword mudaram — recomputa
+
+        # V14.10: válvula de memória — dicts por palavra crescem sem teto
+        # (DIM=768 → 74 KB/palavra nos 4 dicts); corpora grandes estouram
+        # a RAM. Eviction FIFO CONSISTENTE (mesmas chaves nos 4 dicts):
+        # palavra evictada é re-inicializada deterministicamente no
+        # _ensure_word — perde o aprendizado antigo, não a correção.
+        if len(self._input_vec) > 32768:
+            _drop = list(self._input_vec.keys())[:16384]
+            for k in _drop:
+                self._input_vec.pop(k, None)
+                self._output_vec.pop(k, None)
+                self._drift_vec.pop(k, None)
+                self._ctx_vec.pop(k, None)
+                self._vec_cache.pop(k, None)
+        if len(self._cooc) > 131072:
+            for k in list(self._cooc.keys())[:65536]:
+                del self._cooc[k]
 
     # ── Embedding final ────────────────────────────────────────────────────────
 
@@ -8474,6 +8525,11 @@ class NexusV10:
         # V14.7b: habituação dopaminérgica — novidade repetida rende menos
         # (a mosca habitua a estímulos recorrentes; o sono restaura parte)
         self._curiosity_spent: int = 0
+        # V14.8: índice denso de fatos — busca exaustiva por cosseno no
+        # encoder semântico (a cascata lexical/SDR não garantia que o fato
+        # certo ENTRASSE no pool de candidatos da resposta)
+        self._dense_facts: List[Tuple[str, List[float]]] = []
+        self._dense_texts: Set[str] = set()
         # BeamGenerator: geração com beam search + reranking
         self.beam_gen = BeamGenerator(self.ngram, self.embed)
         # AttentionPool: IDF-weighted sentence vectors
@@ -8939,6 +8995,335 @@ class NexusV10:
                         key=lambda a: (-a['similarity'], a['stimulus']))
         return scored[:k]
 
+    def _dense_index_add(self, text: str) -> None:
+        """V14.8: adiciona um fato ao índice denso (embedding centrado)."""
+        try:
+            prov = semantic_provider()
+            if not prov.neural or text in self._dense_texts:
+                return
+            vec = prov.encode(text)
+            if vec:
+                self._dense_facts.append((text, vec))
+                self._dense_texts.add(text)
+        except Exception:
+            pass
+
+    def _dense_index_sync(self) -> int:
+        """V14.8: sincroniza o índice denso com o FactStore (backfill)."""
+        try:
+            prov = semantic_provider()
+            if not prov.neural:
+                return 0
+            for f in self.fact_store._facts:
+                if f not in self._dense_texts:
+                    self._dense_index_add(f)
+        except Exception:
+            pass
+        return len(self._dense_facts)
+
+    def dense_retrieve(self, text: str, top_k: int = 5) -> List[Tuple[float, str]]:
+        """V14.8: busca exaustiva por cosseno denso sobre TODOS os fatos.
+
+        Diferente da cascata (lexical→SDR→embed-mini), que filtra antes de
+        ranquear e pode excluir o fato certo do pool, aqui todo fato é
+        pontuado no espaço do encoder — calibrado: cosseno query↔fato-ouro
+        mediana 0.66 vs 0.31 para distratores.
+        """
+        self._dense_index_sync()
+        if not self._dense_facts:
+            return []
+        try:
+            qv = semantic_provider().encode(text)
+        except Exception:
+            return []
+        if not qv:
+            return []
+        scored: List[Tuple[float, str]] = []
+        df = self._lex_df()
+        if HAS_NUMPY:
+            q = np.asarray(qv, dtype=np.float64)
+            qn = float(np.sqrt(q @ q)) or 1e-9
+            for ft, fv in self._dense_facts:
+                v = np.asarray(fv, dtype=np.float64)
+                vn = float(np.sqrt(v @ v)) or 1e-9
+                cos = float(q @ v) / (qn * vn)
+                sc, _, _, _ = self._qa_score(text, ft, qv=None,
+                                             dense_cos=cos, df=df)
+                scored.append((sc, ft))
+        else:
+            qn = math.sqrt(sum(x * x for x in qv)) or 1e-9
+            for ft, fv in self._dense_facts:
+                vn = math.sqrt(sum(x * x for x in fv)) or 1e-9
+                cos = sum(a * b for a, b in zip(qv, fv)) / (qn * vn)
+                sc, _, _, _ = self._qa_score(text, ft, qv=None,
+                                             dense_cos=cos, df=df)
+                scored.append((sc, ft))
+        scored.sort(key=lambda x: (-x[0], x[1]))
+        return scored[:top_k]
+
+    _WH_WORDS = frozenset({
+        'quem', 'quando', 'onde', 'qual', 'quais', 'quanto', 'quantos',
+        'quantas', 'como', 'porque', 'por', 'que', 'para', 'com', 'uma',
+        'dos', 'das', 'nos', 'nas', 'sao', 'era', 'foi', 'sobre', 'este',
+        'esta', 'esse', 'essa', 'isso', 'aquilo', 'seu', 'sua', 'mais',
+        'esses', 'essas', 'estes', 'estas',
+        'menos', 'muito', 'muita', 'outro', 'outra', 'mesmo', 'tambem',
+    })
+
+    def _lex_df(self) -> dict:
+        """V14.10: frequência de RADICAL (stemmer PT) por fato na base.
+
+        IDF da base de fatos — construído por consulta, sem estado de
+        instância (não precisa de auditoria de load()).
+        """
+        df: dict = {}
+        for ft in self._dense_texts:
+            for s in _content_stems(ft):
+                df[s] = df.get(s, 0) + 1
+        return df
+
+    def _lex_ratio(self, question: str, fact: str,
+                   df: Optional[dict] = None) -> Tuple[float, float]:
+        """V14.10: casamento lexical pergunta↔fato (radicais PT).
+
+        Retorna (razão_plena, rare_recall). 'matou' ↔ 'mataram' casam
+        porque ambos reduzem ao radical 'mat' (stemmer minimalista —
+        o prefixo de 5 chars não pegava verbos de 5 letras).
+        rare_recall = fração das palavras DISTINCTIVAS da pergunta
+        (df ≤ 12 na base) presente no fato.
+        """
+        qw = {w for w in re.findall(r'[a-zà-ÿ]{4,}', _deaccent(question.lower()))
+              if w not in self._WH_WORDS and w not in _STOP_PT}
+        if not qw:
+            return 1.0, 1.0
+        fstems = _content_stems(fact)
+        fprefixes = {fs[:5] for fs in fstems if len(fs) >= 5}
+        hit = rare_hit = 0
+        rare_n = 0
+        for w in qw:
+            s = _stem_pt(w)
+            # radical exato OU prefixo-5 do radical (o artigo às vezes
+            # usa o francês: 'réformés' ↔ 'reformados' → 'reform'/
+            # 'reformad' não casam, 'refor' sim)
+            m = (s in fstems
+                 or (len(s) >= 5 and s[:5] in fprefixes))
+            if m:
+                hit += 1
+            if df is not None and df.get(s, 0) <= 12:
+                rare_n += 1
+                if m:
+                    rare_hit += 1
+        plain = hit / len(qw)
+        rare = (rare_hit / rare_n) if rare_n else plain
+        return plain, rare
+
+    def _q_rare_n(self, question: str, df: dict) -> int:
+        """V14.10: quantas palavras DISTINCTIVAS (df ≤ 12) tem a pergunta."""
+        n = 0
+        for w in {w for w in re.findall(r'[a-zà-ÿ]{4,}',
+                                        _deaccent(question.lower()))
+                  if w not in self._WH_WORDS and w not in _STOP_PT}:
+            if df.get(_stem_pt(w), 0) <= 12:
+                n += 1
+        return n
+
+    _CAP_SKIP = frozenset({
+        'em', 'no', 'na', 'nos', 'nas', 'os', 'as', 'um', 'uma', 'qual',
+        'quais', 'quem', 'quando', 'onde', 'quanto', 'quantos', 'quantas',
+        'como', 'por', 'que', 'para', 'com', 'sobre', 'entre', 'depois',
+        'antes', 'segundo', 'conforme', 'hoje', 'ontem', 'sempre', 'nunca',
+    })
+
+    def _proper_veto(self, question: str, fact: str) -> bool:
+        """V14.10: veto de substantivo próprio não-casado.
+
+        Se a pergunta cita uma ENTIDADE maiúscula ('Gliese', 'Tesla',
+        'McKinsey', 'Saint Kentigern') que não aparece no fato (nem por
+        grafia próxima — 'Victoria' ↔ 'Vitória'), o fato não responde à
+        pergunta. É o sinal que fecha a vazão de especificidade sem
+        bloquear perguntas de tópico treinado ('abriu' é verbo minúsculo,
+        não entidade — o caso V&A segue passando no gate).
+        """
+        # V14.10c: ENTIDADES são sequências maiúsculas ('Who Wants to Be
+        # a Millionaire' = 1 entidade; 'McKinsey' e 'Company' = 2). Cada
+        # entidade da pergunta deve aparecer no fato por algum membro
+        # ≥4 chars (radical ou grafia próxima); casamento parcial conta
+        # ('Millionaire' casa o título inteiro).
+        phrases = [m for m in re.finditer(
+            r'[A-ZÀ-Ú][\wÀ-ÿ-]{2,}'
+            r'(?:[\s&](?:to|of|the|a|o|e|de|do|da|dos|das)?\s*'
+            r'&?\s*[A-ZÀ-Ú][\wÀ-ÿ-]+)*', question)]
+        ents = []
+        for m in phrases:
+            if m.start() == 0:
+                continue      # 1ª palavra: maiúscula por convenção
+            members = [w for w in re.findall(r'[A-ZÀ-Ú][\wÀ-ÿ-]{3,}',
+                                             m.group(0))]
+            keep = [w for w in members
+                    if _deaccent(w.lower()) not in self._CAP_SKIP]
+            if keep:
+                ents.append(keep)
+        if not ents:
+            return False
+        from difflib import SequenceMatcher
+        fstems = _content_stems(fact)
+        fwords = re.findall(r'[a-zà-ÿ]{4,}', _deaccent(fact.lower()))
+        for members in ents:
+            ok = False
+            for w in members:
+                wl = _deaccent(w.lower())
+                if (_stem_pt(wl) in fstems
+                        or any(SequenceMatcher(None, wl, v).ratio() >= 0.85
+                               for v in fwords)):
+                    ok = True
+                    break
+            if not ok:
+                return True
+        return False
+
+    def _qa_score(self, question: str, fact: str,
+                  qv: Optional[List[float]] = None,
+                  dense_cos: Optional[float] = None,
+                  df: Optional[dict] = None
+                  ) -> Tuple[float, float, float, float]:
+        """V14.10: score de seleção do fato-resposta.
+
+        LEXICAL PRIMÁRIO (0.50 × razão plena em radicais) + denso
+        secundário (0.40 × cosseno) + 0.08 × rare_recall + prior de
+        tipo-resposta + antifragmento. Retorna (score, razão_plena,
+        rare_recall, cosseno).
+        """
+        plain, rare = self._lex_ratio(question, fact, df)
+        if dense_cos is None:
+            try:
+                prov = semantic_provider()
+                if qv is None:
+                    qv = prov.encode(question)
+                fv = prov.encode(fact)
+                if qv and fv:
+                    qn = math.sqrt(sum(x * x for x in qv)) or 1e-9
+                    fn = math.sqrt(sum(x * x for x in fv)) or 1e-9
+                    dense_cos = (sum(a * b for a, b in zip(qv, fv))
+                                 / (qn * fn))
+                else:
+                    dense_cos = 0.0
+            except Exception:
+                dense_cos = 0.0
+        q = question.lower()
+        b = -0.08 if (fact[:1].islower()
+                      or fact.count('(') != fact.count(')')) else 0.0
+        if 'quando' in q or 'qual ano' in q:
+            b += 0.06 if re.search(r'1[0-9]{3}|20[0-9]{2}', fact) else -0.04
+        elif ('quantos' in q or 'quanta' in q or 'quanto' in q
+              or 'porcentagem' in q or 'quantidade' in q):
+            b += 0.10 if re.search(r'\d', fact) else -0.04
+        elif 'quem' in q or 'que grupo' in q or 'que pessoa' in q:
+            if (re.search(r'\b(?:rainha|rei|presidente|papa|imperador'
+                          r'|prefeito|governador|fundador|arcebispo'
+                          r'|comandante|diretor|catolicos|protestantes'
+                          r'|huguenotes|soldados|tropas)\b', fact.lower())
+                    or re.search(r'[A-ZÀ-Ú]\w+', fact[1:])):
+                b += 0.10
+        elif 'onde' in q:
+            if re.search(r'\b(?:em|no|na|nos|nas)\s+[A-ZÀ-Ú]', fact):
+                b += 0.04
+        elif 'qual' in q or 'que tipo' in q or 'o que é' in q or 'o que e' in q:
+            if ' é ' in fact[:100].lower() or ' são ' in fact[:100].lower():
+                b += 0.03
+        score = 0.50 * plain + 0.40 * dense_cos + 0.08 * rare + b
+        return score, plain, rare, dense_cos
+
+    def _extract_answer_span(self, question: str, fact: str) -> Optional[str]:
+        """V14.10: extrai o trecho-resposta do fato, guiado pela palavra-
+        interrogativa (quem/quando/onde/quantos/qual). Heurística PT,
+        conservadora: sem confiança, retorna None e a resposta vale o fato
+        completo (a extração nunca remove informação).
+
+        V14.10: (a) QUANDO captura a data completa ('1º de janeiro de
+        1968'), não só o ano; (b) QUANTOS escolhe o número MAIS PRÓXIMO de
+        uma palavra-núcleo da pergunta e nunca um ano ('Em 2005, havia
+        667.000 empresas... o empreiteiro médio emprega menos de 10
+        funcionários' → 'menos de 10 funcionários', não 'Em 2005').
+        """
+        q = question.lower()
+
+        def _ok(span: Optional[str]) -> Optional[str]:
+            if span is None:
+                return None
+            span = span.strip(' .,;:')
+            if 2 <= len(span) <= 90 and span.lower() not in q:
+                return span
+            return None
+
+        if 'quando' in q or 'qual ano' in q:
+            m = re.search(r'\b(?:\d{1,2}º?\s+de\s+)?'
+                          r'(?:janeiro|fevereiro|mar[cç]o|abril|maio|junho'
+                          r'|julho|agosto|setembro|outubro|novembro'
+                          r'|dezembro)\s+de\s+\d{3,4}\b', fact,
+                          re.IGNORECASE)
+            if not m:
+                m = re.search(r'\b(?:entre\s+)?1[0-9]{3}'
+                              r'(?:\s+e\s+1[0-9]{3})?'
+                              r'|\b(?:em|de)\s+1[0-9]{3}\b', fact)
+            return _ok(m.group(0)) if m else None
+
+        if ('quantos' in q or 'quanta' in q or 'quanto' in q
+                or 'porcentagem' in q or 'quantidade' in q):
+            kws = [w for w in re.findall(r'[a-zà-ÿ]{4,}', q)
+                   if w not in self._WH_WORDS and w not in _STOP_PT]
+            kpos = [mm.start() for w in kws
+                    for mm in re.finditer(re.escape(w), fact, re.IGNORECASE)]
+            best = None
+            for nm in re.finditer(r'\b(?:menos|mais|apenas|quase|cerca\s+de'
+                                  r'|nada\s+menos\s+que)?\s*(?:de\s+)?'
+                                  r'(\d[\d.,]*)\s*%?', fact):
+                tok = nm.group(1).rstrip('.,')
+                if re.fullmatch(r'1[89][0-9]{2}|20[0-2][0-9]', tok):
+                    continue          # ano não é a quantidade pedida
+                d = min((abs(nm.start() - p) for p in kpos), default=0)
+                if best is None or d < best[0]:
+                    best = (d, nm)
+            if not best:
+                return None
+            span = best[1].group(0).strip()
+            tail = re.match(r'\s*([a-zà-ÿ]{4,})', fact[best[1].end():],
+                            re.IGNORECASE)
+            if tail:
+                span = span + ' ' + tail.group(1)   # unidade ('funcionários')
+            return _ok(span)
+
+        if 'quem' in q:
+            props = [p for p in re.findall(
+                r'\b[A-ZÀ-Ú][\wÀ-ÿ]+'
+                r'(?:\s+(?:de|da|do|dos|das|e)?\s*'
+                r'[A-ZÀ-Ú][\wÀ-ÿ]+)*', fact) if fact.find(p) > 0]
+            if props:
+                return _ok(props[0])
+            return None
+
+        if 'onde' in q:
+            m = re.search(r'\b(?:em|no|na|nos|nas)\s+'
+                          r'(?:[A-ZÀ-Ú][\wÀ-ÿ]+\s*){1,3}', fact)
+            return _ok(m.group(0)) if m else None
+
+        if 'qual' in q or 'que tipo' in q or 'o que é' in q or 'o que e' in q:
+            m = re.search(r'\b(?:é|são|foi|eram|significa|chama-se)\s+'
+                          r'(.{5,90}?)(?:\.\s|$|\s+e\s+)', fact)
+            if m:
+                span = _ok(m.group(1))
+                if span:
+                    return span
+            # V14.10: 'Qual é X?' onde o predicado ECOA a pergunta
+            # ('Qual é o maior estádio da Austrália?' ↔ '... é o maior
+            # estádio da Austrália...') → o valor-resposta é o SUJEITO
+            m2 = re.match(r'^(.{3,90}?)\s+(?:é|são|foi|eram)\s+', fact)
+            if m2:
+                subj = re.sub(r'^(?:[OoAaOsAs]+\s+)', '', m2.group(1).strip())
+                return _ok(subj)
+            return None
+
+        return None
+
     def _fly_tie_break(self, rer: List[Tuple[float, str]]) -> List[Tuple[float, str]]:
         """V14.7: voto da mosca — desempate afetivo na seleção da resposta.
 
@@ -9134,7 +9519,15 @@ class NexusV10:
         self._last_sdr = sdr
         
         # V10: Predictive cache — busca resposta pré-computada
-        cached = self.pred_cache.get_by_sdr(sdr, min_overlap=0.35)
+        # V14.10: perguntas NÃO usam o cache — o SDR de 60 bits não
+        # discrimina português (0.083 ≈ ruído, medido) e o cache devolvia
+        # respostas do treino para perguntas novas; interrogativas têm
+        # que passar pelo estágio grounded (verificação lexical + gate)
+        _is_interrog = text.rstrip().endswith('?') or re.match(
+            r'\s*(quem|quando|onde|qual|quais|quantos|quantas|quanto|como'
+            r'|por que|porque|o que|que|em que|a que)', text.lower())
+        cached = (None if _is_interrog
+                  else self.pred_cache.get_by_sdr(sdr, min_overlap=0.35))
         if cached and novelty_score < 0.3:
             response = cached  # resposta pré-computada válida
         else:
@@ -9191,11 +9584,15 @@ class NexusV10:
         src = ''
         if assoc.get('stimulus'):
             src = f", parecido com {assoc['stimulus'][:48]!r}"
-        if dec == 'avoid' and val < -1.0:
+        # V14.10: piso de similaridade — com 189 estímulos reforçados no
+        # treino, val>1.5 disparava sozinho (17/18 notas = ruído); a
+        # mosca só fala quando o tema É parecido com um estímulo forte
+        _assoc_sim = assoc.get('similarity', 0.0)
+        if (dec == 'avoid' and val < -1.0 and _assoc_sim >= 0.30):
             return response + f'\n[⚠ memória afetiva: evitação condicionada a este tema{src}]'
-        if dec == 'approach' and val > 1.5:
+        if (dec == 'approach' and val > 1.5 and _assoc_sim >= 0.30):
             return response + f'\n[♥ memória afetiva: atração condicionada a este tema{src}]'
-        if (assoc.get('similarity', 0.0) >= 0.15
+        if (_assoc_sim >= 0.30
                 and abs(assoc.get('valence', 0.0)) >= 0.5
                 and assoc.get('stimulus')):
             return response + (f"\n[corpo cogumelar: este tema lembra "
@@ -9573,6 +9970,11 @@ class NexusV10:
                 'reinforced_registry': [
                     {'text': t, 'bits': s.to_list()}
                     for t, s in getattr(self, '_reinforced', [])[-256:]],
+                # V14.8: índice denso (embedding centrado por fato; 4 dec.)
+                'dense_index': [
+                    [t, [round(x, 4) for x in v]]
+                    for t, v in getattr(self, '_dense_facts', [])
+                ],
             }
             dir_ = os.path.dirname(os.path.abspath(filepath))
             # Cria o temporário no mesmo sistema de arquivos para garantir
@@ -9696,6 +10098,9 @@ class NexusV10:
         n._reinforced = [
             (r.get('text', ''), SparseSDR.from_indices(r.get('bits', [])))
             for r in data.get('reinforced_registry', [])]
+        # V14.8: índice denso
+        n._dense_facts = [(t, v) for t, v in data.get('dense_index', [])]
+        n._dense_texts = {t for t, _ in n._dense_facts}
         def _auto_promote(belief: Belief, brain: CognitiveBrain) -> None:
             brain.store(belief.sdr, belief.text, tag='FACT',
                         confidence=belief.confidence)
@@ -9921,10 +10326,21 @@ class NexusV10:
         if _RE_ANALOGY.search(text):    return self._handle_analogy(text)
         if _RE_DEDUCE.search(text):     return self._handle_deduce(text, sdr)
         # Intents conversacionais — antes de SUBJ_M genérico
-        if _RE_COMPARE.search(text):    return self._handle_compare(text, sdr)
-        if _RE_CAUSE.search(text):      return self._handle_cause(text, sdr)
-        if _RE_LIST.search(text):       return self._handle_list(text, sdr)
-        if _RE_OPINION.search(text):    return self._handle_opinion(text, sdr)
+        # V14.10: PERGUNTAS interrogativas vão primeiro pelo caminho
+        # fundamentado (_handle_query = estágio grounded + gate de
+        # honestidade); os handlers especializados (compare/cause/list/
+        # opinion) atendem o caso não-interrogativo ('compare X e Y' como
+        # comando). Responder pergunta de memória sem passar pelo gate
+        # era a vazão de especificidade ('Por que o Tesla...' ia direto
+        # para o _handle_cause e citava um fato qualquer de 'danos').
+        _interrog_v14 = text.rstrip().endswith('?') or re.match(
+            r'\s*(quem|quando|onde|qual|quais|quantos|quantas|quanto|como'
+            r'|por que|porque|o que|que|em que|a que)', text.lower())
+        if not _interrog_v14:
+            if _RE_COMPARE.search(text):    return self._handle_compare(text, sdr)
+            if _RE_CAUSE.search(text):      return self._handle_cause(text, sdr)
+            if _RE_LIST.search(text):       return self._handle_list(text, sdr)
+            if _RE_OPINION.search(text):    return self._handle_opinion(text, sdr)
         if _RE_META.search(text):       return self._handle_meta(text, sdr)
         # _SUBJ_M tem prioridade sobre _RE_DEDUCE_COND: "o que são répteis?" não é SE-ENTÃO
         if _SUBJ_M.search(text):        return self._handle_query(text, sdr)
@@ -9999,6 +10415,7 @@ class NexusV10:
         """Persiste um fato validado (sem contradição) em todas as camadas."""
         self.brain.store(sdr, text, tag='FACT')
         self.fact_store.add(text)
+        self._dense_index_add(text)   # V14.8: índice denso
         self.ngram.learn_text(text)
         self.conditional.learn(text)
         self.deductive.learn(text)
@@ -10779,6 +11196,13 @@ class NexusV10:
                 if qv is not None:
                     _cands: List[str] = []
                     _seen_c: Set[str] = set()
+                    # V14.8: busca Densa exaustiva semeia o pool — garante
+                    # que o fato certo esteja entre os candidatos (a cascata
+                    # lexical/SDR podia excluí-lo antes do re-rank)
+                    for _ds, _dt in self.dense_retrieve(text, top_k=5):
+                        if _dt not in _seen_c:
+                            _seen_c.add(_dt)
+                            _cands.append(_dt)
                     for _h in self.fact_store.search(text, top_k=6, min_score=0.2):
                         if _h not in _seen_c:
                             _seen_c.add(_h)
@@ -10788,21 +11212,71 @@ class NexusV10:
                             _seen_c.add(_t)
                             _cands.append(_t)
                     _rer: List[Tuple[float, str]] = []
+                    _breakdown: dict = {}
                     _nqv = math.sqrt(sum(x * x for x in qv)) or 1e-9
+                    _dfq = self._lex_df()
                     for _c in _cands[:10]:
                         _cv = _prov.encode(_c)
                         if _cv is None:
                             continue
                         _ncv = math.sqrt(sum(x * x for x in _cv)) or 1e-9
-                        _rer.append((sum(x * y for x, y in zip(qv, _cv))
-                                     / (_nqv * _ncv), _c))
+                        _cos = (sum(x * y for x, y in zip(qv, _cv))
+                                / (_nqv * _ncv))
+                        _sc, _pl, _rr, _dc = self._qa_score(
+                            text, _c, qv=None, dense_cos=_cos, df=_dfq)
+                        _breakdown[_c] = (_pl, _rr, _dc)
+                        _rer.append((_sc, _c))
                     _rer.sort(key=lambda x: (-x[0], x[1]))
                     _rer = self._fly_tie_break(_rer)   # V14.7: voto da mosca
-                    if _rer and _rer[0][0] >= 0.35:
+                    # gate V14.10: percorre os candidatos em ordem de score;
+                    # responde com o primeiro que (a) não é vetado por
+                    # entidade própria ausente ('Gliese', 'Tesla'), e
+                    # (b) tem semântica forte (cos ≥ 0.60) OU cobre a
+                    # maioria dos radicais da pergunta E, havendo ≥2
+                    # palavras distintivas, cobre metade delas — é isso
+                    # que separa tópico treinado de tópico nunca visto
+                    _gate_ok = False
+                    for _gi in range(len(_rer)):
+                        if _rer[_gi][0] < 0.35:
+                            break
+                        _pl0, _rr0, _dc0 = _breakdown.get(
+                            _rer[_gi][1], (0.0, 0.0, 0.0))
+                        if self._proper_veto(text, _rer[_gi][1]):
+                            continue
+                        if _dc0 >= 0.60 or (
+                                _pl0 >= 0.5
+                                and (self._q_rare_n(text, _dfq) < 2
+                                     or _rr0 >= 0.5)):
+                            if _gi:
+                                _pick = _rer.pop(_gi)
+                                _rer.insert(0, _pick)
+                            _gate_ok = True
+                            break
+                    if _gate_ok and _rer:
+                        # V14.8: RESPOSTA-VALOR PRIMEIRO — extrai o trecho
+                        # que responde à pergunta e o põe na frente; o fato
+                        # completo segue como fonte (contenção garantida)
+                        _span = self._extract_answer_span(text, _rer[0][1])
+                        if _span:
+                            return f'{_span} — {_rer[0][1]}'
                         _extra_g = ''
-                        if len(_rer) > 1 and _rer[1][0] >= 0.35:
+                        if len(_rer) > 1 and _rer[1][0] >= 0.40:
                             _extra_g = _rer[1][1]
                         return self.mouth.speak_fact(_rer[0][1], _extra_g)
+                    if (self._dense_facts
+                            and (text.rstrip().endswith('?')
+                                 or re.match(
+                                     r'\s*(quem|quando|onde|qual|quais|'
+                                     r'quantos|quantas|quanto|como|por que|'
+                                     r'porque|o que|que|em que|a que)',
+                                     text.lower()))):
+                        # V14.10: RECUSA HONESTA — o pool esgotou TODA a
+                        # memória (denso + fact_store + retriever) e nada
+                        # cobre o vocabulário distintivo da pergunta; cair
+                        # para a cascata seria responder com ruído
+                        return ('Ainda não sei responder isso — não aprendi '
+                                'fatos que cubram essa pergunta. Ensine-me: '
+                                'aprenda: ...')
         except Exception:
             pass   # fallback total: segue o cascade original
 
@@ -11097,6 +11571,9 @@ class NexusV10:
             self._last_novelty = 0.0
         if not hasattr(self, '_curiosity_spent'):
             self._curiosity_spent = 0
+        if not hasattr(self, '_dense_facts'):
+            self._dense_facts = []
+            self._dense_texts = set()
         # Restaura cada sub-sistema via from_dict
         if 'encoder' in data:
             self.encoder = MultiLobeEncoder.from_dict(data['encoder'])
@@ -11315,6 +11792,11 @@ class NexusV10:
             if min_fact_len <= len(sent) <= max_fact_len:
                 # Remove artefatos markdown: ###, **, ```, >, |
                 sent_clean = re.sub(r'[*#`>|]', '', sent).strip()
+                # V14.9: filtro de qualidade — fragmentos de segmentação
+                # (início minúsculo, parêntese órfão) não entram na memória
+                if (sent_clean[:1].islower()
+                        or sent_clean.count('(') != sent_clean.count(')')):
+                    continue
                 if len(sent_clean) >= min_fact_len:
                     result = self.chat(f'aprenda: {sent_clean}')
                     if 'Aprendi' in result or '[dedup]' not in result.lower():
@@ -12898,6 +13380,43 @@ def run_nexus_tests(verbose: bool = True) -> bool:
     n14e.sleep(1)
     chk('Sono restaura parte da dopamina de curiosidade',
         n14e._curiosity_spent == 10, f'gasto: 20 → {n14e._curiosity_spent}')
+
+    # V14.8: índice denso + resposta-valor
+    if prov14.neural:
+        n14f = NexusFinal()
+        n14f.disable_autosave()
+        n14f.chat('aprenda: a torre eiffel foi inaugurada em 1889 em paris')
+        n14f.chat('aprenda: o mar negro banha a ucrania e a turquia')
+        n14f._dense_index_sync()
+        chk('Índice denso indexa fatos aprendidos',
+            len(n14f._dense_facts) >= 2,
+            f"{len(n14f._dense_facts)} fatos")
+        dh = n14f.dense_retrieve('quando a torre eiffel foi inaugurada?', top_k=2)
+        chk('dense_retrieve acha o fato certo (top-1)',
+            dh and 'eiffel' in dh[0][1] and dh[0][0] > 0.3,
+            f"cos={dh[0][0]:.3f}" if dh else 'vazio')
+        span_w = n14f._extract_answer_span('quando a torre foi inaugurada?',
+                                           'a torre eiffel foi inaugurada em 1889 em paris')
+        chk('Extração de trecho-resposta (quando → ano)',
+            span_w is not None and '1889' in span_w, f'span={span_w!r}')
+        span_q = n14f._extract_answer_span('o que é o mar negro?',
+                                           'o mar negro é um mar interior banhando a ucrania')
+        chk('Extração de trecho-resposta (o que é → complemento copular)',
+            span_q is not None and 'mar interior' in span_q, f'span={span_q!r}')
+        r14f = n14f.chat('quando a torre eiffel foi inaugurada?')
+        chk('Resposta-valor primeiro (span — fato completo como fonte)',
+            '1889' in (r14f or '') and 'eiffel' in (r14f or ''),
+            (r14f or '')[:56])
+        n14f.save('/tmp/nx_v148.json')
+        m14f = NexusV10.load('/tmp/nx_v148.json')
+        dh_rt = m14f.dense_retrieve('quando a torre eiffel foi inaugurada?', top_k=1)
+        chk('Índice denso sobrevive ao round-trip (sem re-embed)',
+            dh_rt and 'eiffel' in dh_rt[0][1] and len(m14f._dense_facts) >= 2,
+            f"{len(m14f._dense_facts)} fatos restaurados")
+        try:
+            os.unlink('/tmp/nx_v148.json')
+        except OSError:
+            pass
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # RESULTADO FINAL

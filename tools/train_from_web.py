@@ -173,7 +173,7 @@ def main() -> int:
         n_para, n_facts = 0, 0
         for ai, art in enumerate(train_arts):
             for para in art['paragraphs'][:args.max_paragraphs]:
-                n_facts += kernel.learn_document(para['context'])
+                n_facts += kernel.learn_document(para['context'], max_fact_len=350)
                 n_para += 1
             print(f'  [{ai + 1:2d}/{len(train_arts)}] {art["title"][:34]:36s} '
                   f'{n_para} parágrafos → {n_facts} fatos ({time.time() - t0:.0f}s)')
